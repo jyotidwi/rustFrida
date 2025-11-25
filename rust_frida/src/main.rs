@@ -2,8 +2,8 @@
 
 use clap::Parser;
 use libc::{bind, listen, sleep, sockaddr_un, AF_UNIX, SOCK_STREAM};
-use libc::{c_int, c_void, close, connect, dlopen, free, iovec, malloc, mmap, mprotect, munmap, pid_t, pthread_create, pthread_detach, recvmsg, socket, write, PTRACE_CONT, PTRACE_GETREGSET, PTRACE_SETREGSET};
-use libc::{dlsym, memcpy, memfd_create, snprintf, write as libc_write, MFD_CLOEXEC};
+use libc::{c_int, c_void, close, connect, free, iovec, malloc, mmap, mprotect, munmap, pid_t, pthread_create, pthread_detach, recvmsg, socket, write, PTRACE_CONT, PTRACE_GETREGSET, PTRACE_SETREGSET};
+use libc::{strlen, dlopen, dlsym, dlerror, memcpy, memfd_create, snprintf, write as libc_write, MFD_CLOEXEC};
 use nix::errno::Errno;
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
@@ -175,12 +175,14 @@ define_libc_functions!(
     pthread_create,
     pthread_detach,
     snprintf,    // 用于格式化字符串
-    memcpy
+    memcpy,
+    strlen
 );
 
 define_dl_functions!(
     dlopen,    // 动态加载
-    dlsym      // 动态符号查找
+    dlsym,      // 动态符号查找
+    dlerror
 );
 
 /// 用户空间寄存器结构体
@@ -465,7 +467,7 @@ fn handle_socket_connection(mut stream: UnixStream) {
         }
         
         if let Ok(msg) = String::from_utf8(buffer[..size].to_vec()) {
-            println!("收到消息: {}", msg);
+            print!("{}", msg);
             
             // 如果是 HELLO_LOADER，额外发送 memfd
             if msg.trim() == "HELLO_LOADER" {
@@ -550,9 +552,9 @@ fn start_socket_listener(socket_path: &str) -> Result<JoinHandle<()>, Box<dyn st
 }
 
 // 嵌入loader.bin
-const SHELLCODE: &[u8] = include_bytes!("../loader/build/loader.bin");
+const SHELLCODE: &[u8] = include_bytes!("../../loader/build/loader.bin");
 
-const AGENT_SO: &[u8] = include_bytes!("../target/aarch64-linux-android/debug/libagent.so");
+const AGENT_SO: &[u8] = include_bytes!("../../target/aarch64-linux-android/debug/libagent.so");
 
 /// 向远程进程内存写入任意类型的数据
 /// 

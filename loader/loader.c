@@ -42,11 +42,13 @@ typedef struct {
     uintptr_t pthread_detach; // 用于分离线程
     uintptr_t snprintf;  // 用于格式化字符串
     uintptr_t memcpy;
+    uintptr_t strlen;
 } LibcOffsets;
 
 typedef struct {
     uintptr_t dlopen;   // 动态加载
     uintptr_t dlsym;    // 动态符号查找
+    uintptr_t dlerror;
 } DlOffsets;
 
 // 定义函数指针类型
@@ -63,8 +65,10 @@ typedef int (*pthread_create_t)(pthread_t*, const pthread_attr_t*, void* (*)(voi
 typedef int (*pthread_detach_t)(pthread_t);
 typedef void* (*dlopen_t)(const char*, int);
 typedef void* (*dlsym_t)(void*, const char*);
+typedef char* (*dlerror_t)();
 typedef int (*snprintf_t)(char*, size_t, const char*, ...);
 typedef void* (*memcpy_t)(void*, const void*, size_t);
+typedef size_t (*strlen_t)(const char *);
 
 static int recv_fd(int sock, ssize_t (*recvmsg_fn)(int, struct msghdr*, int));
 
@@ -79,10 +83,12 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
     dlopen_t dlopen = (dlopen_t)dl->dlopen;
     recvmsg_t recvmsg = (recvmsg_t)offsets->recvmsg;
     dlsym_t dlsym = (dlsym_t)dl->dlsym;
+    dlerror_t dlerror = (dlerror_t)dl->dlerror;
     pthread_create_t pthread_create = (pthread_create_t)offsets->pthread_create;
     snprintf_t snprintf_fn = (snprintf_t)offsets->snprintf;
     pthread_detach_t pthread_detach = (pthread_detach_t)offsets->pthread_detach;
     memcpy_t memcpy = (memcpy_t)offsets->memcpy;
+    strlen_t strlen = (strlen_t)offsets->strlen;
 
     // 获取字符串引用 (现在所有字符串都已经有 NULL 结尾)
     const char* socket_name = (const char*)table->socket_name;
@@ -166,6 +172,8 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
     // 加载共享库
     void* handle = dlopen(path, RTLD_NOW);
     if (!handle) {
+        char* msg = dlerror();
+        write(sock, msg, strlen(msg));
         close(memfd);
         close(sock);
         free(offsets);

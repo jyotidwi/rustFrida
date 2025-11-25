@@ -1,0 +1,50 @@
+[package]
+name = "frida-gum"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[features]
+script = ["frida-gum-sys/js"]
+auto-download = ["frida-gum-sys/auto-download"]
+backtrace = ["libc", "std"]
+event-sink = ["frida-gum-sys/event-sink"]
+invocation-listener = ["frida-gum-sys/invocation-listener"]
+memory-access-monitor = ["std"]
+module-names = ["std"]
+stalker-observer = ["frida-gum-sys/stalker-observer"]
+stalker-params = ["frida-gum-sys/stalker-params"]
+std = []
+
+[dependencies]
+cstr_core = { version = "0.2.6", default-features = false, features = [
+    "alloc",
+] }
+frida-gum-sys = { path = "../frida-gum-sys", version = "0.16.10" }
+libc = { version = "0.2.172", default-features = false, optional = true }
+num = { version = "0.4.3", default-features = false }
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.19", default-features = false }
+paste = { version = "1", default-features = false }
+spin = { version = "0.10", default-features = false, features = [
+    "mutex",
+    "spin_mutex",
+] }
+
+[dev-dependencies]
+lazy_static = "1"
+
+[badges]
+maintenance = { status = "experimental" }
+
+[package.metadata.docs.rs]
+features = [
+    "event-sink",
+    "invocation-listener",
+    "stalker-observer",
+    "stalker-params",
+    "std",
+]

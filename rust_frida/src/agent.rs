@@ -3,6 +3,7 @@ mod jhook;
 mod gumlibc;
 mod writer;
 mod relocater;
+mod stalker;
 
 use crate::gumlibc::{gum_libc_ptrace, gum_libc_waitpid};
 use crate::jhook::jhook;
@@ -21,7 +22,7 @@ use std::process;
 use std::ptr;
 use std::ptr::null_mut;
 use std::sync::{ Mutex, OnceLock};
-use clear_cache::clear_cache;
+use stalker::follow;
 
 // 定义我们自己的Result类型，错误统一为String
 type Result<T> = std::result::Result<T, String>;
@@ -539,6 +540,10 @@ pub extern "C" fn hello_entry(){
                             }
                         });
                     },
+                    Some("stalker") => {
+                        let tid = command.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                        follow(tid)
+                    },
                     _ => {
                         stream.write_all(format!("无效命令: {}", command).as_bytes()).unwrap();
                     }
@@ -753,7 +758,7 @@ pub fn transformer_global(addr: usize) -> Result<usize>{
         for instruct in gen_jump_to_transformer(){
             exe_mem.write_u32(instruct).unwrap();
         }
-        clear_cache(exe_mem.ptr,exe_mem.ptr.add(exe_mem.size));
+        // clear_cache(exe_mem.ptr,exe_mem.ptr.add(exe_mem.size));
         Ok(ret_addr)
     }
 }

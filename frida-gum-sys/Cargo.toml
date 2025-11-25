@@ -1,0 +1,25 @@
+[package]
+name = "frida-gum-sys"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+
+[features]
+auto-download = ["frida-build"]
+event-sink = ["cc"]
+invocation-listener = ["cc"]
+stalker-observer = ["cc"]
+stalker-params = ["cc"]
+js = []
+
+[build-dependencies]
+bindgen = "0.71.1"
+cc = { version = "1", optional = true }
+frida-build = { path = "../frida-build", optional = true, version = "0.16.10" }
+
+[badges]
+maintenance = { status = "experimental" }
