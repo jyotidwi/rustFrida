@@ -1,6 +1,6 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-use libc::{bind, listen, socket, sockaddr_un, AF_UNIX, SOCK_STREAM};
+use libc::{bind, listen, sockaddr_un, socket, AF_UNIX, SOCK_STREAM};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use once_cell::unsync::Lazy;
 use std::io::{IoSlice, Read, Write};
@@ -14,7 +14,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::{log_info, log_success, log_error, log_agent};
+use crate::{log_agent, log_error, log_info, log_success};
 
 pub(crate) static AGENT_MEMFD: AtomicI32 = AtomicI32::new(-1);
 pub(crate) static STOP_LISTENER: AtomicBool = AtomicBool::new(false);
@@ -27,7 +27,10 @@ pub(crate) struct SyncChannel<T> {
 
 impl<T: Clone> SyncChannel<T> {
     pub(crate) fn new() -> Self {
-        SyncChannel { mutex: Mutex::new(None), cvar: Condvar::new() }
+        SyncChannel {
+            mutex: Mutex::new(None),
+            cvar: Condvar::new(),
+        }
     }
 
     /// 设置值并通知所有等待者（由 handle_socket_connection 调用）。
@@ -54,11 +57,17 @@ impl<T: Clone> SyncChannel<T> {
         };
         *guard = None;
         f();
-        let result = self.cvar.wait_timeout_while(guard, dur, |val| val.is_none());
+        let result = self
+            .cvar
+            .wait_timeout_while(guard, dur, |val| val.is_none());
         match result {
             Ok((guard, timeout_result)) => {
-                if timeout_result.timed_out() { None } else { guard.clone() }
-            },
+                if timeout_result.timed_out() {
+                    None
+                } else {
+                    guard.clone()
+                }
+            }
             Err(_) => None,
         }
     }
@@ -69,11 +78,17 @@ impl<T: Clone> SyncChannel<T> {
             Ok(g) => g,
             Err(_) => return None,
         };
-        let result = self.cvar.wait_timeout_while(guard, dur, |val| val.is_none());
+        let result = self
+            .cvar
+            .wait_timeout_while(guard, dur, |val| val.is_none());
         match result {
             Ok((guard, timeout_result)) => {
-                if timeout_result.timed_out() { None } else { guard.clone() }
-            },
+                if timeout_result.timed_out() {
+                    None
+                } else {
+                    guard.clone()
+                }
+            }
             Err(_) => None,
         }
     }
@@ -96,7 +111,10 @@ pub(crate) fn eval_state() -> &'static SyncChannel<std::result::Result<String, S
 pub(crate) static GLOBAL_SENDER: OnceLock<Sender<String>> = OnceLock::new();
 pub(crate) static mut AGENT_STAT: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
 
-pub(crate) fn send_fd_over_unix_socket(stream: &UnixStream, fd_to_send: RawFd) -> Result<(), String> {
+pub(crate) fn send_fd_over_unix_socket(
+    stream: &UnixStream,
+    fd_to_send: RawFd,
+) -> Result<(), String> {
     let data = b"AGENT_SO";
     let iov = [IoSlice::new(data)];
     let fds = [fd_to_send];
@@ -135,16 +153,18 @@ pub(crate) fn handle_socket_connection(mut stream: UnixStream) {
                 thread::spawn(move || {
                     let (sd, rx) = channel();
                     match GLOBAL_SENDER.set(sd) {
-                        Ok(_) => {},
+                        Ok(_) => {}
                         Err(_) => {
                             log_error!("GLOBAL_SENDER already set!");
                             return;
                         }
                     }
-                    unsafe { *(AGENT_STAT.write().unwrap()) = true; }
+                    unsafe {
+                        *(AGENT_STAT.write().unwrap()) = true;
+                    }
                     while let Ok(msg) = rx.recv() {
                         match stream_clone.write_all(msg.as_bytes()) {
-                            Ok(_) => {},
+                            Ok(_) => {}
                             Err(e) => {
                                 log_error!("stream 写入失败: {}", e);
                                 break;
@@ -153,8 +173,15 @@ pub(crate) fn handle_socket_connection(mut stream: UnixStream) {
                     }
                 });
             } else if trimmed.contains("COMPLETE:") {
-                // 从消息中提取 COMPLETE: 部分（可能和其他输出混在一起）
+                // COMPLETE: 响应可能包含多行候选项，保持整体处理
                 let complete_part = if let Some(pos) = trimmed.find("COMPLETE:") {
+                    // Log any lines that appear before COMPLETE:
+                    for line in trimmed[..pos].lines() {
+                        let l = line.trim();
+                        if !l.is_empty() {
+                            log_agent!("{}", l);
+                        }
+                    }
                     &trimmed[pos + "COMPLETE:".len()..]
                 } else {
                     ""
@@ -162,31 +189,36 @@ pub(crate) fn handle_socket_connection(mut stream: UnixStream) {
                 let candidates: Vec<String> = if complete_part.is_empty() {
                     vec![]
                 } else {
-                    complete_part.lines().map(|s| s.to_string()).collect()
+                    complete_part
+                        .lines()
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
                 };
                 complete_state().send(candidates);
-            } else if trimmed.contains("EVAL_ERR:") {
-                let err_part = if let Some(pos) = trimmed.find("EVAL_ERR:") {
-                    &trimmed[pos + "EVAL_ERR:".len()..]
-                } else {
-                    ""
-                };
-                eval_state().send(Err(err_part.to_string()));
-            } else if trimmed.contains("EVAL:") {
-                let eval_part = if let Some(pos) = trimmed.find("EVAL:") {
-                    &trimmed[pos + "EVAL:".len()..]
-                } else {
-                    ""
-                };
-                eval_state().send(Ok(eval_part.to_string()));
             } else {
-                log_agent!("{}", trimmed);
+                // 按行处理：EVAL_ERR:/EVAL: 路由到 eval_state，其余（含 console.log）显示到终端
+                for line in trimmed.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if line.starts_with("EVAL_ERR:") {
+                        eval_state().send(Err(line["EVAL_ERR:".len()..].to_string()));
+                    } else if line.starts_with("EVAL:") {
+                        eval_state().send(Ok(line["EVAL:".len()..].to_string()));
+                    } else {
+                        log_agent!("{}", line);
+                    }
+                }
             }
         }
     }
 }
 
-pub(crate) fn start_socket_listener(socket_path: &str) -> Result<JoinHandle<()>, Box<dyn std::error::Error>> {
+pub(crate) fn start_socket_listener(
+    socket_path: &str,
+) -> Result<JoinHandle<()>, Box<dyn std::error::Error>> {
     // 创建 socket
     let fd = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
     if fd < 0 {
@@ -203,13 +235,7 @@ pub(crate) fn start_socket_listener(socket_path: &str) -> Result<JoinHandle<()>,
     let sockaddr_len = (size_of_val(&addr.sun_family) + 1 + path_len) as u32;
 
     // 绑定
-    let ret = unsafe {
-        bind(
-            fd,
-            &addr as *const _ as *const _,
-            sockaddr_len,
-        )
-    };
+    let ret = unsafe { bind(fd, &addr as *const _ as *const _, sockaddr_len) };
     if ret < 0 {
         return Err(Box::new(std::io::Error::last_os_error()));
     }
@@ -222,23 +248,23 @@ pub(crate) fn start_socket_listener(socket_path: &str) -> Result<JoinHandle<()>,
 
     // 转为 Rust 的 UnixListener，设为非阻塞以便响应停止信号
     let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
-    listener.set_nonblocking(true).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    let handle = thread::spawn(move || {
-        loop {
-            if STOP_LISTENER.load(Ordering::SeqCst) {
-                break;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    let handle = thread::spawn(move || loop {
+        if STOP_LISTENER.load(Ordering::SeqCst) {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                thread::spawn(move || {
+                    handle_socket_connection(stream);
+                });
             }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    thread::spawn(move || {
-                        handle_socket_connection(stream);
-                    });
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(e) => log_error!("接受连接失败: {}", e),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(std::time::Duration::from_millis(10));
             }
+            Err(e) => log_error!("接受连接失败: {}", e),
         }
     });
     Ok(handle)

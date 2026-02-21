@@ -5,13 +5,22 @@
 
 #![cfg(feature = "quickjs")]
 
-use quickjs_hook::{init_hook_engine, get_or_init_engine, load_script, complete_script, set_console_callback, cleanup_hook_engine, cleanup_hooks, cleanup_engine};
-use std::sync::OnceLock;
+use libc::{
+    mmap, munmap, sysconf, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE,
+    _SC_PAGESIZE,
+};
+use quickjs_hook::{
+    cleanup_engine, cleanup_hook_engine, cleanup_hooks, complete_script, get_or_init_engine,
+    init_hook_engine, load_script, set_console_callback,
+};
 use std::io::Write;
-use libc::{mmap, munmap, PROT_READ, PROT_WRITE, PROT_EXEC, MAP_PRIVATE, MAP_ANONYMOUS, sysconf, _SC_PAGESIZE};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
-use crate::{GLOBAL_STREAM, log_msg};
+static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+use crate::{log_msg, GLOBAL_STREAM};
 
 /// Executable memory for hooks
 static EXEC_MEM: OnceLock<ExecMemory> = OnceLock::new();
@@ -72,10 +81,13 @@ unsafe impl Sync for ExecMemory {}
 
 /// Initialize the QuickJS engine and hook system
 pub fn init() -> Result<(), String> {
+    if ENGINE_INITIALIZED.load(Ordering::SeqCst) {
+        return Err("JS 引擎已初始化".to_string());
+    }
+
     // Allocate executable memory for hooks (64KB)
-    let exec_mem = EXEC_MEM.get_or_init(|| {
-        ExecMemory::new(64 * 1024).expect("Failed to allocate executable memory")
-    });
+    let exec_mem = EXEC_MEM
+        .get_or_init(|| ExecMemory::new(64 * 1024).expect("Failed to allocate executable memory"));
 
     // Initialize hook engine
     init_hook_engine(exec_mem.as_ptr(), exec_mem.size())?;
@@ -90,6 +102,7 @@ pub fn init() -> Result<(), String> {
         }
     });
 
+    ENGINE_INITIALIZED.store(true, Ordering::SeqCst);
     log_msg("[quickjs] Initialized successfully\n".to_string());
 
     Ok(())
@@ -104,9 +117,8 @@ pub fn init() -> Result<(), String> {
 /// * `Ok(String)` with the result string (empty for `undefined`) on success
 /// * `Err(String)` with error message on failure
 pub fn execute_script(script: &str) -> Result<String, String> {
-    // Ensure engine is initialized
-    if EXEC_MEM.get().is_none() {
-        init()?;
+    if !ENGINE_INITIALIZED.load(Ordering::SeqCst) {
+        return Err("JS 引擎未初始化，请先执行 jsinit".to_string());
     }
 
     load_script(script)
@@ -117,14 +129,18 @@ pub fn execute_script(script: &str) -> Result<String, String> {
 /// Returns a newline-joined string of matching property names, or an empty string
 /// if the engine is not initialised.
 pub fn complete(prefix: &str) -> String {
+    if !ENGINE_INITIALIZED.load(Ordering::SeqCst) {
+        return String::new();
+    }
     let candidates = complete_script(prefix);
     candidates.join("\n")
 }
 
 /// Cleanup QuickJS resources
 pub fn cleanup() {
-    cleanup_engine();      // 销毁 JSEngine (context + runtime)
-    cleanup_hooks();       // 清理所有 hooks
+    ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
+    cleanup_engine(); // 销毁 JSEngine (context + runtime)
+    cleanup_hooks(); // 清理所有 hooks
     cleanup_hook_engine(); // 清理 hook 引擎内存
     log_msg("[quickjs] Cleanup complete\n".to_string());
 }

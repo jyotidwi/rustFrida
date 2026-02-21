@@ -1,21 +1,26 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-mod jhook;
 mod gumlibc;
-mod writer;
+mod jhook;
 mod relocater;
 mod trace;
+mod writer;
 
-#[cfg(feature = "frida-gum")]
-mod stalker;
 #[cfg(feature = "qbdi")]
 mod qbdi_trace;
 #[cfg(feature = "quickjs")]
 mod quickjs_loader;
+#[cfg(feature = "frida-gum")]
+mod stalker;
 
 use crate::jhook::jhook;
-use libc::{c_char, c_int, close, kill, mmap, munmap, pid_t, sockaddr, sockaddr_un, sysconf, AF_UNIX, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, SIGSTOP, _SC_PAGESIZE, SIGTRAP};
-use libc::{sigaction, siginfo_t, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SA_SIGINFO, SA_ONSTACK};
+use libc::{
+    c_char, c_int, close, kill, mmap, munmap, pid_t, sockaddr, sockaddr_un, sysconf, AF_UNIX,
+    MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, SIGSTOP, SIGTRAP, _SC_PAGESIZE,
+};
+use libc::{
+    sigaction, siginfo_t, SA_ONSTACK, SA_SIGINFO, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV,
+};
 use std::ffi::{c_void, CStr};
 use std::fmt::format;
 use std::io::Write;
@@ -26,7 +31,7 @@ use std::os::unix::net::UnixStream;
 use std::process;
 use std::ptr;
 use std::ptr::null_mut;
-use std::sync::{ Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 #[cfg(feature = "frida-gum")]
@@ -109,7 +114,12 @@ impl ExecMem {
             if ptr == libc::MAP_FAILED {
                 return Err(Error::last_os_error().to_string());
             }
-            Ok(ExecMem { ptr: ptr as *mut u8, size: page_size, used: 0, page_size })
+            Ok(ExecMem {
+                ptr: ptr as *mut u8,
+                size: page_size,
+                used: 0,
+                page_size,
+            })
         }
     }
 
@@ -117,7 +127,7 @@ impl ExecMem {
     pub fn write(&mut self, data: &[u8]) -> Result<*mut u8> {
         if self.used + data.len() > self.size {
             // self.grow()?;
-            return Err(String::from("剩余exe_mem耗尽"))
+            return Err(String::from("剩余exe_mem耗尽"));
         }
         unsafe {
             let dest = self.ptr.add(self.used);
@@ -151,8 +161,12 @@ impl ExecMem {
                 0,
             );
             if new_ptr == libc::MAP_FAILED {
-                return Err(format!("无法扩展内存 ({}->{}): {}", 
-                    self.size, new_size, Error::last_os_error()));
+                return Err(format!(
+                    "无法扩展内存 ({}->{}): {}",
+                    self.size,
+                    new_size,
+                    Error::last_os_error()
+                ));
             }
             // 拷贝旧数据
             ptr::copy_nonoverlapping(self.ptr, new_ptr as *mut u8, self.used);
@@ -169,12 +183,14 @@ impl ExecMem {
             munmap(self.ptr as *mut _, self.size);
         }
     }
-    pub fn current_addr(&self) -> usize { unsafe { self.ptr.add(self.used) as usize } }
+    pub fn current_addr(&self) -> usize {
+        unsafe { self.ptr.add(self.used) as usize }
+    }
 
     pub fn external_write_instruct(&mut self) -> usize {
         unsafe {
             let result = self.ptr.add(self.used) as usize;
-            self.used+=4;
+            self.used += 4;
             result
         }
     }
@@ -215,13 +231,7 @@ fn connect_socket() -> Result<UnixStream> {
     let addr_len = (size_of::<libc::sa_family_t>() + 1 + name.len()) as u32;
 
     // 连接
-    let ret = unsafe {
-        libc::connect(
-            fd,
-            &addr as *const _ as *const sockaddr,
-            addr_len,
-        )
-    };
+    let ret = unsafe { libc::connect(fd, &addr as *const _ as *const sockaddr, addr_len) };
     if ret != 0 {
         let err = Error::last_os_error();
         unsafe { close(fd) };
@@ -232,8 +242,6 @@ fn connect_socket() -> Result<UnixStream> {
     let stream = unsafe { UnixStream::from_raw_fd(fd) };
     Ok(stream)
 }
-
-
 
 static GLOBAL_STREAM: OnceLock<UnixStream> = OnceLock::new();
 static CACHE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -271,10 +279,10 @@ extern "C" {
 /// dladdr 返回的符号信息结构体
 #[repr(C)]
 struct DlInfo {
-    dli_fname: *const c_char,  // 包含地址的共享库路径
-    dli_fbase: *mut c_void,    // 共享库的基地址
-    dli_sname: *const c_char,  // 最近符号的名称
-    dli_saddr: *mut c_void,    // 最近符号的地址
+    dli_fname: *const c_char, // 包含地址的共享库路径
+    dli_fbase: *mut c_void,   // 共享库的基地址
+    dli_sname: *const c_char, // 最近符号的名称
+    dli_saddr: *mut c_void,   // 最近符号的地址
 }
 
 extern "C" {
@@ -440,7 +448,9 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, _ucontext: 
              Fault Address: 0x{:x}\n\
              PID: {}\n\
              TID: {}\n",
-            sig_name, sig, fault_addr,
+            sig_name,
+            sig,
+            fault_addr,
             process::id(),
             libc::gettid()
         );
@@ -555,15 +565,22 @@ fn install_panic_hook() {
         let bt = Backtrace::force_capture();
 
         // 获取panic位置
-        let location = panic_info.location()
+        let location = panic_info
+            .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".to_string());
 
         // 获取panic消息
-        let payload = panic_info.payload()
+        let payload = panic_info
+            .payload()
             .downcast_ref::<&str>()
             .copied()
-            .or_else(|| panic_info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .or_else(|| {
+                panic_info
+                    .payload()
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+            })
             .unwrap_or("unknown panic");
 
         let msg = format!(
@@ -573,7 +590,8 @@ fn install_panic_hook() {
              PID: {}, TID: {}\n\n\
              Backtrace:\n{}\n\
              =================\n\n",
-            location, payload,
+            location,
+            payload,
             process::id(),
             unsafe { libc::gettid() },
             bt
@@ -585,7 +603,7 @@ fn install_panic_hook() {
 
 /// 日志函数：socket未连接时缓存，已连接时直接发送
 /// 自动添加 [agent] 前缀
-fn log_msg(msg: String ){
+fn log_msg(msg: String) {
     let prefixed = format!("[agent] {}", msg);
     match GLOBAL_STREAM.get() {
         Some(mut stream) => {
@@ -643,14 +661,15 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
     }
 
-
     // GLOBAL_STREAM.lock().unwrap().set(connect_socket().unwrap()).unwrap();
-    GLOBAL_STREAM.set(connect_socket().expect("wwb connect socket failed!!!")).unwrap();
+    GLOBAL_STREAM
+        .set(connect_socket().expect("wwb connect socket failed!!!"))
+        .unwrap();
     let mut stream = GLOBAL_STREAM.get().unwrap();
     let _ = stream.write("HELLO_AGENT".as_bytes()).unwrap();
     std::thread::sleep(Duration::from_secs(2));
     flush_cached_logs();
-    
+
     // 循环等待stream发送命令
     let mut buffer = [0u8; 1024];
     loop {
@@ -661,14 +680,16 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
                 // let _ = stream.write(format!("收到命令: {}", command).as_bytes()).unwrap();
                 // 可以在这里添加命令处理逻辑
                 process_cmd(command);
-            },
+            }
             Ok(_) => {
                 // 连接关闭
                 break;
-            },
+            }
             Err(e) => {
                 // 读取错误
-                stream.write_all(format!("读取命令错误: {}", e).as_bytes()).unwrap();
+                stream
+                    .write_all(format!("读取命令错误: {}", e).as_bytes())
+                    .unwrap();
                 break;
             }
         }
@@ -679,70 +700,113 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
 fn process_cmd(command: &str) {
     match command.split_whitespace().next() {
         Some("trace") => {
-            let tid = command.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let tid = command
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             std::thread::spawn(move || {
                 match trace::gum_modify_thread(tid) {
                     Ok(pid) => {
-                        let _ = GLOBAL_STREAM.get().unwrap().write_all(format!("clone success {}", pid).as_bytes());
+                        let _ = GLOBAL_STREAM
+                            .get()
+                            .unwrap()
+                            .write_all(format!("clone success {}", pid).as_bytes());
                     }
                     Err(e) => {
-                        let _ = GLOBAL_STREAM.get().unwrap().write_all(format!("error: {}", e).as_bytes());
+                        let _ = GLOBAL_STREAM
+                            .get()
+                            .unwrap()
+                            .write_all(format!("error: {}", e).as_bytes());
                     }
                 }
                 unsafe { kill(process::id() as pid_t, SIGSTOP) }
             });
-        },
+        }
         Some("jhook") => {
-            std::thread::spawn(|| {
-                match jhook() {
-                    Ok(_) => {},
-                    Err(e) => {
-                        let _ = GLOBAL_STREAM.get().unwrap().write_all(format!("{}", e).as_bytes());
-                    }
+            std::thread::spawn(|| match jhook() {
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = GLOBAL_STREAM
+                        .get()
+                        .unwrap()
+                        .write_all(format!("{}", e).as_bytes());
                 }
             });
-        },
+        }
         #[cfg(feature = "frida-gum")]
         Some("stalker") => {
-            let tid = command.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let tid = command
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             stalker::follow(tid)
-        },
+        }
         #[cfg(feature = "frida-gum")]
         Some("hfl") => {
             let mut cmds = command.split_whitespace();
-            let md = cmds.nth(1).unwrap();
-            let offset = cmds.next().and_then(|s| {
-                let s = s.strip_prefix("0x").unwrap_or(s);
-                usize::from_str_radix(s, 16).ok()
-            }).unwrap_or(0);
+            let md = match cmds.nth(1) {
+                Some(m) => m,
+                None => {
+                    log_msg("[hfl] 用法: hfl <module> <offset>\n".to_string());
+                    return;
+                }
+            };
+            let offset = cmds
+                .next()
+                .and_then(|s| {
+                    let s = s.strip_prefix("0x").unwrap_or(s);
+                    usize::from_str_radix(s, 16).ok()
+                })
+                .unwrap_or(0);
             stalker::hfollow(md, offset)
-        },
+        }
+        #[cfg(not(feature = "frida-gum"))]
+        Some("hfl") | Some("stalker") => {
+            log_msg("[agent] 当前构建不支持该命令，需要 frida-gum feature\n".to_string());
+        }
         #[cfg(feature = "qbdi")]
         Some("qfl") => {
             let mut cmds = command.split_whitespace();
-            let md = cmds.nth(1).unwrap();
-            let offset = cmds.next().and_then(|s| {
-                let s = s.strip_prefix("0x").unwrap_or(s);
-                usize::from_str_radix(s, 16).ok()
-            }).unwrap_or(0);
+            let md = match cmds.nth(1) {
+                Some(m) => m,
+                None => {
+                    log_msg("[qfl] 用法: qfl <module> <offset>\n".to_string());
+                    return;
+                }
+            };
+            let offset = cmds
+                .next()
+                .and_then(|s| {
+                    let s = s.strip_prefix("0x").unwrap_or(s);
+                    usize::from_str_radix(s, 16).ok()
+                })
+                .unwrap_or(0);
             qbdi_trace::qfollow(md, offset)
-        },
+        }
+        #[cfg(not(feature = "qbdi"))]
+        Some("qfl") => {
+            log_msg("[agent] 当前构建不支持该命令，需要 qbdi feature\n".to_string());
+        }
         #[cfg(feature = "quickjs")]
-        Some("jsinit") => {
-            match quickjs_loader::init() {
-                Ok(_) => log_msg("[quickjs] Engine initialized\n".to_string()),
-                Err(e) => log_msg(format!("[quickjs] Init error: {}\n", e)),
-            }
+        Some("jsinit") => match quickjs_loader::init() {
+            Ok(_) => log_msg("[quickjs] Engine initialized\n".to_string()),
+            Err(e) => log_msg(format!("[quickjs] Init error: {}\n", e)),
         },
         #[cfg(feature = "quickjs")]
         Some("jsclean") => {
             quickjs_loader::cleanup();
             log_msg("[quickjs] Cleaned up\n".to_string());
-        },
+        }
         #[cfg(feature = "quickjs")]
         Some("loadjs") => {
             // 同步执行并通过 EVAL:/EVAL_ERR: 协议返回结果
-            let script = command.strip_prefix("loadjs").unwrap_or("").trim().to_string();
+            let script = command
+                .strip_prefix("loadjs")
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if script.is_empty() {
                 if let Some(mut stream) = GLOBAL_STREAM.get() {
                     let _ = stream.write_all(b"EVAL_ERR:[quickjs] Error: empty script\n");
@@ -753,7 +817,7 @@ fn process_cmd(command: &str) {
                         if let Some(mut stream) = GLOBAL_STREAM.get() {
                             let _ = stream.write_all(format!("EVAL:{}\n", result).as_bytes());
                         }
-                    },
+                    }
                     Err(e) => {
                         if let Some(mut stream) = GLOBAL_STREAM.get() {
                             let _ = stream.write_all(format!("EVAL_ERR:{}\n", e).as_bytes());
@@ -761,7 +825,7 @@ fn process_cmd(command: &str) {
                     }
                 }
             }
-        },
+        }
         #[cfg(feature = "quickjs")]
         Some("jscomplete") => {
             let prefix = command.strip_prefix("jscomplete").unwrap_or("").trim();
@@ -770,16 +834,7 @@ fn process_cmd(command: &str) {
             if let Some(mut stream) = GLOBAL_STREAM.get() {
                 let _ = stream.write_all(format!("COMPLETE:{}\n", result).as_bytes());
             }
-        },
-        _ => {
-            log_msg("无效命令".to_string())
         }
+        _ => log_msg("无效命令".to_string()),
     }
 }
-
-
-
-
-
-
-

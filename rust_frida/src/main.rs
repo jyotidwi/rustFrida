@@ -1,21 +1,21 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-mod logger;
 mod args;
-mod types;
-mod process;
-mod injection;
 mod communication;
+mod injection;
+mod logger;
+mod process;
 mod repl;
+mod types;
 
 use args::Args;
 use clap::Parser;
-use communication::{AGENT_MEMFD, AGENT_STAT, GLOBAL_SENDER, start_socket_listener};
-use injection::{AGENT_SO, create_memfd_with_data, inject_to_process, watch_and_inject};
+use communication::{start_socket_listener, AGENT_MEMFD, AGENT_STAT, GLOBAL_SENDER};
+use injection::{create_memfd_with_data, inject_to_process, watch_and_inject, AGENT_SO};
 use libc::{close, sleep};
-use repl::{CommandCompleter, print_help, run_js_repl};
-use rustyline::Editor;
+use repl::{print_help, run_js_repl, CommandCompleter};
 use rustyline::error::ReadlineError;
+use rustyline::Editor;
 use std::sync::atomic::Ordering;
 use types::get_string_table_names;
 
@@ -47,7 +47,11 @@ fn main() {
             if available_names.contains(&name) {
                 string_overrides.insert(name.to_string(), value.to_string());
             } else {
-                log_warn!("未知的字符串名称 '{}', 可用名称: {:?}", name, available_names);
+                log_warn!(
+                    "未知的字符串名称 '{}', 可用名称: {:?}",
+                    name,
+                    available_names
+                );
             }
         } else {
             log_warn!("无效的字符串格式 '{}', 应为 name=value", s);
@@ -134,12 +138,16 @@ fn main() {
                     print_help();
                     continue;
                 }
+                if line == "exit" || line == "quit" {
+                    log_info!("退出交互模式");
+                    break;
+                }
                 if line == "jsrepl" {
                     run_js_repl(sender);
                     continue;
                 }
                 match sender.send(line) {
-                    Ok(_) => {},
+                    Ok(_) => {}
                     Err(e) => {
                         log_error!("发送命令失败: {}", e);
                         break;

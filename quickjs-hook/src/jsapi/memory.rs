@@ -2,8 +2,8 @@
 
 use crate::context::JSContext;
 use crate::ffi;
-use crate::value::JSValue;
 use crate::jsapi::ptr::{create_native_pointer, get_native_pointer_addr};
+use crate::value::JSValue;
 use std::ffi::CString;
 
 /// Helper to get address from argument
@@ -39,7 +39,10 @@ unsafe extern "C" fn memory_read_u16(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 1 {
-        return ffi::JS_ThrowTypeError(ctx, b"readU16() requires 1 argument\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"readU16() requires 1 argument\0".as_ptr() as *const _,
+        );
     }
 
     let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
@@ -59,7 +62,10 @@ unsafe extern "C" fn memory_read_u32(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 1 {
-        return ffi::JS_ThrowTypeError(ctx, b"readU32() requires 1 argument\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"readU32() requires 1 argument\0".as_ptr() as *const _,
+        );
     }
 
     let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
@@ -80,7 +86,10 @@ unsafe extern "C" fn memory_read_u64(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 1 {
-        return ffi::JS_ThrowTypeError(ctx, b"readU64() requires 1 argument\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"readU64() requires 1 argument\0".as_ptr() as *const _,
+        );
     }
 
     let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
@@ -100,7 +109,10 @@ unsafe extern "C" fn memory_read_pointer(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 1 {
-        return ffi::JS_ThrowTypeError(ctx, b"readPointer() requires 1 argument\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"readPointer() requires 1 argument\0".as_ptr() as *const _,
+        );
     }
 
     let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
@@ -120,7 +132,10 @@ unsafe extern "C" fn memory_read_cstring(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 1 {
-        return ffi::JS_ThrowTypeError(ctx, b"readCString() requires 1 argument\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"readCString() requires 1 argument\0".as_ptr() as *const _,
+        );
     }
 
     let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
@@ -152,7 +167,10 @@ unsafe extern "C" fn memory_read_byte_array(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 2 {
-        return ffi::JS_ThrowTypeError(ctx, b"readByteArray() requires 2 arguments\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"readByteArray() requires 2 arguments\0".as_ptr() as *const _,
+        );
     }
 
     let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
@@ -176,7 +194,10 @@ unsafe extern "C" fn memory_write_u8(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 2 {
-        return ffi::JS_ThrowTypeError(ctx, b"writeU8() requires 2 arguments\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"writeU8() requires 2 arguments\0".as_ptr() as *const _,
+        );
     }
 
     let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
@@ -197,7 +218,10 @@ unsafe extern "C" fn memory_write_u16(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 2 {
-        return ffi::JS_ThrowTypeError(ctx, b"writeU16() requires 2 arguments\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"writeU16() requires 2 arguments\0".as_ptr() as *const _,
+        );
     }
 
     let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
@@ -218,7 +242,10 @@ unsafe extern "C" fn memory_write_u32(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 2 {
-        return ffi::JS_ThrowTypeError(ctx, b"writeU32() requires 2 arguments\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"writeU32() requires 2 arguments\0".as_ptr() as *const _,
+        );
     }
 
     let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
@@ -239,7 +266,10 @@ unsafe extern "C" fn memory_write_u64(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 2 {
-        return ffi::JS_ThrowTypeError(ctx, b"writeU64() requires 2 arguments\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"writeU64() requires 2 arguments\0".as_ptr() as *const _,
+        );
     }
 
     let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {

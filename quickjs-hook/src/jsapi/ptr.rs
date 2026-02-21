@@ -95,7 +95,9 @@ unsafe extern "C" fn js_ptr(
 
         addr = match u64::from_str_radix(s, 16) {
             Ok(v) => v,
-            Err(_) => return ffi::JS_ThrowTypeError(ctx, b"Invalid hex string\0".as_ptr() as *const _),
+            Err(_) => {
+                return ffi::JS_ThrowTypeError(ctx, b"Invalid hex string\0".as_ptr() as *const _)
+            }
         };
     } else if arg.is_int() || arg.is_float() {
         // Number
@@ -104,7 +106,10 @@ unsafe extern "C" fn js_ptr(
         // Already a NativePointer
         addr = ptr_addr;
     } else {
-        return ffi::JS_ThrowTypeError(ctx, b"ptr() argument must be number or string\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"ptr() argument must be number or string\0".as_ptr() as *const _,
+        );
     }
 
     create_native_pointer(ctx, addr).raw()
@@ -211,7 +216,8 @@ pub fn register_ptr(ctx: &JSContext) {
         macro_rules! add_method {
             ($name:expr, $func:expr, $argc:expr) => {
                 let cname = CString::new($name).unwrap();
-                let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some($func), cname.as_ptr(), $argc);
+                let func_val =
+                    ffi::qjs_new_cfunction(ctx.as_ptr(), Some($func), cname.as_ptr(), $argc);
                 let atom = ffi::JS_NewAtom(ctx.as_ptr(), cname.as_ptr());
                 ffi::qjs_set_property(ctx.as_ptr(), proto, atom, func_val);
                 ffi::JS_FreeAtom(ctx.as_ptr(), atom);

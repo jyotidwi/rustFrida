@@ -3,7 +3,10 @@
 use crate::gumlibc::{gum_libc_ptrace, gum_libc_waitpid};
 use crate::relocater;
 use crate::{ExecMem, GLOBAL_STREAM};
-use libc::{c_int, c_void, iovec, mmap, pid_t, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, CLONE_SETTLS, CLONE_VM, PTRACE_ATTACH, PTRACE_DETACH};
+use libc::{
+    c_int, c_void, iovec, mmap, pid_t, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE,
+    PROT_READ, PROT_WRITE, PTRACE_ATTACH, PTRACE_DETACH,
+};
 use nix::errno::Errno;
 use once_cell::unsync::Lazy;
 use std::io::Write;
@@ -16,20 +19,20 @@ type Result<T> = std::result::Result<T, String>;
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UserRegs {
-    pub regs: [usize; 31],  // X0-X30 寄存器
-    pub sp: usize,          // SP 栈指针
-    pub pc: usize,          // PC 程序计数器
-    pub pstate: usize,      // 处理器状态
+    pub regs: [usize; 31], // X0-X30 寄存器
+    pub sp: usize,         // SP 栈指针
+    pub pc: usize,         // PC 程序计数器
+    pub pstate: usize,     // 处理器状态
 }
 
 /// ARM64 分支指令类型
 #[derive(Debug, Clone, Copy)]
 enum Arm64BranchType {
-    UnconditionalBranch { target: usize },                  // B, BL
-    ConditionalBranch { taken: usize, not_taken: usize },   // B.cond
-    CompareBranch { taken: usize, not_taken: usize },       // CBZ, CBNZ
-    TestBitBranch { taken: usize, not_taken: usize },       // TBZ, TBNZ
-    IndirectBranch { target: usize },                       // BR, BLR, RET
+    UnconditionalBranch { target: usize },                // B, BL
+    ConditionalBranch { taken: usize, not_taken: usize }, // B.cond
+    CompareBranch { taken: usize, not_taken: usize },     // CBZ, CBNZ
+    TestBitBranch { taken: usize, not_taken: usize },     // TBZ, TBNZ
+    IndirectBranch { target: usize },                     // BR, BLR, RET
 }
 
 /// ARM64 指令 opcodes 常量
@@ -106,7 +109,10 @@ fn set_reg(pid: i32, regs: &mut UserRegs) -> Result<()> {
         &mut iov as *const _ as usize,
     );
     if ret == -1 {
-        return Err(format!("设置寄存器失败: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "设置寄存器失败: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
@@ -115,7 +121,8 @@ fn attach_to_thread(thread_id: i32) -> Result<()> {
     match gum_libc_ptrace(PTRACE_ATTACH, thread_id, 0, 0) {
         res if res >= 0 => {
             let mut status: usize = 0;
-            let wait_result = gum_libc_waitpid(thread_id, &mut status as *mut _ as usize, 0x40000000);
+            let wait_result =
+                gum_libc_waitpid(thread_id, &mut status as *mut _ as usize, 0x40000000);
             if wait_result < 0 {
                 return Err("waitpid failed!!!!".to_string() + &(-wait_result).to_string());
             }
@@ -268,7 +275,11 @@ fn parse_indirect_branch(instr: u32, regs: &UserRegs) -> Option<Arm64BranchType>
         }
         RET_OPCODE => {
             let rn = ((instr >> 5) & 0x1F) as usize;
-            let target = if rn == 31 { regs.regs[30] } else { regs.regs[rn] };
+            let target = if rn == 31 {
+                regs.regs[30]
+            } else {
+                regs.regs[rn]
+            };
             Some(Arm64BranchType::IndirectBranch { target })
         }
         _ => None,
@@ -282,22 +293,22 @@ fn arm64_cond_pass(cond: u8, pstate: usize) -> bool {
     let c = (pstate >> 29) & 1;
     let v = (pstate >> 28) & 1;
     match cond {
-        0x0 => z == 1,           // EQ
-        0x1 => z == 0,           // NE
-        0x2 => c == 1,           // CS/HS
-        0x3 => c == 0,           // CC/LO
-        0x4 => n == 1,           // MI
-        0x5 => n == 0,           // PL
-        0x6 => v == 1,           // VS
-        0x7 => v == 0,           // VC
-        0x8 => c == 1 && z == 0, // HI
-        0x9 => c == 0 || z == 1, // LS
-        0xA => n == v,           // GE
-        0xB => n != v,           // LT
+        0x0 => z == 1,             // EQ
+        0x1 => z == 0,             // NE
+        0x2 => c == 1,             // CS/HS
+        0x3 => c == 0,             // CC/LO
+        0x4 => n == 1,             // MI
+        0x5 => n == 0,             // PL
+        0x6 => v == 1,             // VS
+        0x7 => v == 0,             // VC
+        0x8 => c == 1 && z == 0,   // HI
+        0x9 => c == 0 || z == 1,   // LS
+        0xA => n == v,             // GE
+        0xB => n != v,             // LT
         0xC => z == 0 && (n == v), // GT
         0xD => z == 1 || (n != v), // LE
-        0xE => true,             // AL
-        0xF => false,            // NV (保留)
+        0xE => true,               // AL
+        0xF => false,              // NV (保留)
         _ => false,
     }
 }
@@ -310,7 +321,11 @@ fn resolve_branch_target(branch_type: Arm64BranchType, instr: u32, regs: &UserRe
 
         Arm64BranchType::ConditionalBranch { taken, not_taken } => {
             let cond = (instr & 0xF) as u8;
-            if arm64_cond_pass(cond, regs.pstate) { taken } else { not_taken }
+            if arm64_cond_pass(cond, regs.pstate) {
+                taken
+            } else {
+                not_taken
+            }
         }
 
         Arm64BranchType::CompareBranch { taken, not_taken } => {
@@ -318,7 +333,11 @@ fn resolve_branch_target(branch_type: Arm64BranchType, instr: u32, regs: &UserRe
             let val = regs.regs[rt];
             let is_cbz = (instr & arm64_opcodes::CBZ_CBNZ_MASK) == arm64_opcodes::CBZ_VALUE;
             let zero = val == 0;
-            if (is_cbz && zero) || (!is_cbz && !zero) { taken } else { not_taken }
+            if (is_cbz && zero) || (!is_cbz && !zero) {
+                taken
+            } else {
+                not_taken
+            }
         }
 
         Arm64BranchType::TestBitBranch { taken, not_taken } => {
@@ -330,7 +349,11 @@ fn resolve_branch_target(branch_type: Arm64BranchType, instr: u32, regs: &UserRe
             let val = regs.regs[rt] as u64;
             let bit_set = ((val >> bit_ix) & 1) != 0;
             let is_tbz = (instr & arm64_opcodes::CBZ_CBNZ_MASK) == arm64_opcodes::TBZ_VALUE;
-            if (is_tbz && !bit_set) || (!is_tbz && bit_set) { taken } else { not_taken }
+            if (is_tbz && !bit_set) || (!is_tbz && bit_set) {
+                taken
+            } else {
+                not_taken
+            }
         }
     }
 }
@@ -339,7 +362,10 @@ pub unsafe fn resolve_next_addr(instr_ptr: *const u32, regs: UserRegs) -> Option
     use core::ptr;
 
     let instr = ptr::read_volatile(instr_ptr).swap_bytes();
-    let _ = GLOBAL_STREAM.get().unwrap().write_all(format!("instruct: {:x}", instr).as_bytes());
+    let _ = GLOBAL_STREAM
+        .get()
+        .unwrap()
+        .write_all(format!("instruct: {:x}", instr).as_bytes());
 
     let pc = (instr_ptr as usize).wrapping_add(4);
 
@@ -408,19 +434,15 @@ pub fn gen_mov_reg_addr(reg: u8, imm: usize) -> Vec<u32> {
         if i == 0 {
             // MOVZ
             if imm16 != 0 {
-                let instr = 0xD2800000
-                    | ((imm16 as u32) << 5)
-                    | ((reg as u32) & 0x1F)
-                    | ((i as u32) << 21);
+                let instr =
+                    0xD2800000 | ((imm16 as u32) << 5) | ((reg as u32) & 0x1F) | ((i as u32) << 21);
                 code.push(instr);
             }
         } else {
             // MOVK
             if imm16 != 0 {
-                let instr = 0xF2800000
-                    | ((imm16 as u32) << 5)
-                    | ((reg as u32) & 0x1F)
-                    | ((i as u32) << 21);
+                let instr =
+                    0xF2800000 | ((imm16 as u32) << 5) | ((reg as u32) & 0x1F) | ((i as u32) << 21);
                 code.push(instr);
             }
         }
@@ -497,7 +519,10 @@ pub fn transformer_global(addr: usize) -> Result<usize> {
         INSTRUCT_PTR = addr as *const u32;
         let closure_result = {
             while !is_arm64_branch(*INSTRUCT_PTR) {
-                relocater::relocate_one_a64(INSTRUCT_PTR as usize, exe_mem.external_write_instruct());
+                relocater::relocate_one_a64(
+                    INSTRUCT_PTR as usize,
+                    exe_mem.external_write_instruct(),
+                );
                 INSTRUCT_PTR = INSTRUCT_PTR.add(1);
             }
             Ok(())
@@ -578,7 +603,9 @@ extern "C" fn tracer(thread_id: i32) -> c_int {
 
         let mut regs = get_registers(thread_id).unwrap();
         INSTRUCT_PTR = regs.pc as *const u32;
-        let _ = stream.write_all(("\nget pc: ".to_string() + &(INSTRUCT_PTR as usize).to_string()).as_bytes());
+        let _ = stream.write_all(
+            ("\nget pc: ".to_string() + &(INSTRUCT_PTR as usize).to_string()).as_bytes(),
+        );
 
         while !is_arm64_branch(*INSTRUCT_PTR) {
             relocater::relocate_one_a64(INSTRUCT_PTR as usize, exe_mem.external_write_instruct());

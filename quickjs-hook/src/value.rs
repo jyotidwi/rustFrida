@@ -177,9 +177,7 @@ impl JSValue {
     pub fn set_property(&self, ctx: *mut ffi::JSContext, name: &str, value: JSValue) -> bool {
         let cname = CString::new(name).unwrap();
         let atom = unsafe { ffi::JS_NewAtom(ctx, cname.as_ptr()) };
-        let ret = unsafe {
-            ffi::qjs_set_property(ctx, self.0, atom, value.0)
-        };
+        let ret = unsafe { ffi::qjs_set_property(ctx, self.0, atom, value.0) };
         unsafe { ffi::JS_FreeAtom(ctx, atom) };
         ret >= 0
     }

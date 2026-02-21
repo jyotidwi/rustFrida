@@ -49,7 +49,12 @@ fn main() {
         // Generate bindings for QuickJS + wrapper
         let bindings = bindgen::Builder::default()
             .header(quickjs_src.join("quickjs.h").to_string_lossy().to_string())
-            .header(src_path.join("quickjs_wrapper.h").to_string_lossy().to_string())
+            .header(
+                src_path
+                    .join("quickjs_wrapper.h")
+                    .to_string_lossy()
+                    .to_string(),
+            )
             .clang_arg(format!("-I{}", quickjs_src.display()))
             .clang_arg(format!("-I{}", src_path.display()))
             .clang_arg("-xc")
@@ -76,18 +81,32 @@ fn main() {
         // QuickJS source not found - generate empty bindings
         std::fs::write(
             out_path.join("quickjs_bindings.rs"),
-            "// QuickJS source not found - run setup script to download\n"
-        ).expect("Failed to write placeholder bindings");
+            "// QuickJS source not found - run setup script to download\n",
+        )
+        .expect("Failed to write placeholder bindings");
 
-        println!("cargo:warning=QuickJS source not found at {:?}", quickjs_src);
+        println!(
+            "cargo:warning=QuickJS source not found at {:?}",
+            quickjs_src
+        );
         println!("cargo:warning=Run: cd quickjs-hook && ./setup_quickjs.sh");
     }
 
     // Generate bindings for hook_engine (includes arm64_writer and arm64_relocator)
     let hook_bindings = bindgen::Builder::default()
         .header(src_path.join("hook_engine.h").to_string_lossy().to_string())
-        .header(src_path.join("arm64_writer.h").to_string_lossy().to_string())
-        .header(src_path.join("arm64_relocator.h").to_string_lossy().to_string())
+        .header(
+            src_path
+                .join("arm64_writer.h")
+                .to_string_lossy()
+                .to_string(),
+        )
+        .header(
+            src_path
+                .join("arm64_relocator.h")
+                .to_string_lossy()
+                .to_string(),
+        )
         .clang_arg(format!("-I{}", src_path.display()))
         .clang_arg("-xc")
         .generate_comments(true)

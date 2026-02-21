@@ -92,7 +92,9 @@ impl JSContext {
             let exc_val = JSValue(exception);
 
             // Get the error message
-            let message = exc_val.to_string(self.ptr.as_ptr()).unwrap_or_else(|| "Unknown error".to_string());
+            let message = exc_val
+                .to_string(self.ptr.as_ptr())
+                .unwrap_or_else(|| "Unknown error".to_string());
 
             // Try to get stack trace
             let stack = exc_val.get_property(self.ptr.as_ptr(), "stack");
@@ -154,9 +156,8 @@ impl JSContext {
         let global = self.global_object();
         let cname = CString::new(name).unwrap();
 
-        let func_val = unsafe {
-            ffi::qjs_new_cfunction(self.ptr.as_ptr(), func, cname.as_ptr(), argc)
-        };
+        let func_val =
+            unsafe { ffi::qjs_new_cfunction(self.ptr.as_ptr(), func, cname.as_ptr(), argc) };
 
         let result = global.set_property(self.ptr.as_ptr(), name, JSValue(func_val));
         global.free(self.ptr.as_ptr());
@@ -180,7 +181,12 @@ impl JSContext {
     }
 
     /// Call a function
-    pub fn call_function(&self, func: JSValue, this: JSValue, args: &[JSValue]) -> Result<JSValue, String> {
+    pub fn call_function(
+        &self,
+        func: JSValue,
+        this: JSValue,
+        args: &[JSValue],
+    ) -> Result<JSValue, String> {
         let argc = args.len() as i32;
         let argv: Vec<ffi::JSValue> = args.iter().map(|v| v.raw()).collect();
 
@@ -190,7 +196,11 @@ impl JSContext {
                 func.raw(),
                 this.raw(),
                 argc,
-                if argv.is_empty() { std::ptr::null_mut() } else { argv.as_ptr() as *mut _ },
+                if argv.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    argv.as_ptr() as *mut _
+                },
             )
         };
 

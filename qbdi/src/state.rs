@@ -206,7 +206,6 @@ impl GPRState {
     }
 }
 
-
 impl FPRState {
     /// Create a new zeroed FPRState
     pub fn new() -> Self {
@@ -329,4 +328,3 @@ impl FPRState {
         true
     }
 }
-

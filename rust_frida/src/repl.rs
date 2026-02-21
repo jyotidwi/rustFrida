@@ -9,20 +9,22 @@ use rustyline::{CompletionType, Config, Context, Editor, Helper};
 use std::sync::mpsc::Sender;
 
 use crate::communication::{complete_state, eval_state};
-use crate::{log_error};
+use crate::log_error;
 
 /// 支持的命令列表及其说明
 pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
-    ("trace",      "[tid]",            "ptrace 指令追踪"),
-    ("jhook",      "",                 "Java/JNI hooking"),
-    ("stalker",    "[tid]",            "Frida Stalker 追踪"),
-    ("hfl",        "<module> <offset>","Interceptor hook 指定偏移"),
-    ("qfl",        "<module> <offset>","QBDI 追踪指定偏移"),
-    ("jsinit",     "",                 "初始化 QuickJS 引擎"),
-    ("loadjs",     "<script>",         "执行 JavaScript 代码"),
-    ("jsclean",    "",                 "清理 QuickJS 引擎"),
-    ("jsrepl",     "",                 "进入 JS REPL 模式（Tab 动态补全）"),
-    ("help",       "",                 "显示此帮助信息"),
+    ("trace", "[tid]", "ptrace 指令追踪"),
+    ("jhook", "", "Java/JNI hooking"),
+    ("stalker", "[tid]", "Frida Stalker 追踪"),
+    ("hfl", "<module> <offset>", "Interceptor hook 指定偏移"),
+    ("qfl", "<module> <offset>", "QBDI 追踪指定偏移"),
+    ("jsinit", "", "初始化 QuickJS 引擎"),
+    ("loadjs", "<script>", "执行 JavaScript 代码"),
+    ("jsclean", "", "清理 QuickJS 引擎"),
+    ("jsrepl", "", "进入 JS REPL 模式（Tab 动态补全）"),
+    ("help", "", "显示此帮助信息"),
+    ("exit", "", "退出程序"),
+    ("quit", "", "退出程序"),
 ];
 
 /// Tab 补全器：仅补全第一个 token（命令名）
@@ -90,7 +92,9 @@ impl JsReplCompleter {
         let sender = self.sender.clone();
         // 持锁 clear + 发命令 + wait，原子消除竞态窗口
         complete_state()
-            .clear_then_recv(timeout, || { let _ = sender.send(cmd); })
+            .clear_then_recv(timeout, || {
+                let _ = sender.send(cmd);
+            })
             .unwrap_or_default()
     }
 }
@@ -147,7 +151,9 @@ impl Hinter for JsReplCompleter {
         }
 
         // Check if current input matches the cached prefix context
-        if !cached_prefix.starts_with(before_cursor) && !before_cursor.starts_with(cached_prefix.as_str()) {
+        if !cached_prefix.starts_with(before_cursor)
+            && !before_cursor.starts_with(cached_prefix.as_str())
+        {
             return None;
         }
 
@@ -159,7 +165,8 @@ impl Hinter for JsReplCompleter {
         };
 
         // Filter candidates that match current typing
-        let matching: Vec<&String> = candidates.iter()
+        let matching: Vec<&String> = candidates
+            .iter()
             .filter(|c| c.starts_with(prop_part) && c.as_str() != prop_part)
             .collect();
 
@@ -168,7 +175,8 @@ impl Hinter for JsReplCompleter {
         }
 
         // Build hint: show as " [debug|error|info|log|warn]"
-        let hint_list = matching.iter()
+        let hint_list = matching
+            .iter()
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join("|");
@@ -197,7 +205,7 @@ impl Helper for JsReplCompleter {}
 
 /// 打印命令帮助表
 pub(crate) fn print_help() {
-    use crate::logger::{BOLD, CYAN, GREEN, RESET, YELLOW, DIM};
+    use crate::logger::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
     println!("\n{BOLD}{CYAN}可用命令:{RESET}");
     println!("{DIM}  {:<10} {:<22} {}{RESET}", "命令", "参数", "说明");
     println!("{DIM}  {:-<10} {:-<22} {:-<20}{RESET}", "", "", "");
@@ -259,7 +267,7 @@ pub(crate) fn run_js_repl(sender: &Sender<String>) {
                         if !output.is_empty() {
                             println!("\x1b[32m=> {}\x1b[0m", output);
                         }
-                    },
+                    }
                     Some(Err(err)) => println!("\x1b[31m[JS error] {}\x1b[0m", err),
                 }
             }

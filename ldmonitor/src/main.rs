@@ -26,7 +26,9 @@ fn main() -> anyhow::Result<()> {
             } else {
                 println!(
                     "android_dlopen_ext called: pid={}, uid={}, path={}",
-                    info.pid(), info.uid, info.path
+                    info.pid(),
+                    info.uid,
+                    info.path
                 );
             }
         } else {

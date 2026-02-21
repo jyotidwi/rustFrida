@@ -25,17 +25,17 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-pub mod ffi;
-pub mod runtime;
 pub mod context;
-pub mod value;
+pub mod ffi;
 pub mod jsapi;
+pub mod runtime;
+pub mod value;
 
 pub use context::JSContext;
-pub use runtime::JSRuntime;
-pub use value::JSValue;
 pub use jsapi::console::set_console_callback;
 pub use jsapi::hook_api::cleanup_hooks;
+pub use runtime::JSRuntime;
+pub use value::JSValue;
 
 use std::sync::Mutex;
 
@@ -52,9 +52,7 @@ static JS_ENGINE: Mutex<Option<JSEngine>> = Mutex::new(None);
 /// * `Ok(())` on success
 /// * `Err(String)` on failure
 pub fn init_hook_engine(exec_mem: *mut u8, size: usize) -> Result<(), String> {
-    let result = unsafe {
-        ffi::hook::hook_engine_init(exec_mem as *mut _, size)
-    };
+    let result = unsafe { ffi::hook::hook_engine_init(exec_mem as *mut _, size) };
 
     if result == 0 {
         Ok(())
@@ -128,7 +126,9 @@ unsafe impl Sync for JSEngine {}
 
 /// Get or initialize the global JS engine
 pub fn get_or_init_engine() -> Result<(), String> {
-    let mut engine = JS_ENGINE.lock().map_err(|e| format!("Failed to lock JS engine: {}", e))?;
+    let mut engine = JS_ENGINE
+        .lock()
+        .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
     if engine.is_none() {
         *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
     }
@@ -138,7 +138,9 @@ pub fn get_or_init_engine() -> Result<(), String> {
 /// Load and execute a JavaScript script using the global engine.
 /// Returns the string representation of the result, or an empty string for `undefined`.
 pub fn load_script(script: &str) -> Result<String, String> {
-    let mut engine = JS_ENGINE.lock().map_err(|e| format!("Failed to lock JS engine: {}", e))?;
+    let mut engine = JS_ENGINE
+        .lock()
+        .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
     if engine.is_none() {
         *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
     }
@@ -148,7 +150,9 @@ pub fn load_script(script: &str) -> Result<String, String> {
     let result = if value.is_undefined() {
         String::new()
     } else {
-        value.to_string(engine.context().as_ptr()).unwrap_or_default()
+        value
+            .to_string(engine.context().as_ptr())
+            .unwrap_or_default()
     };
     value.free(engine.context().as_ptr());
     Ok(result)
@@ -237,7 +241,7 @@ pub fn complete_script(prefix: &str) -> Vec<String> {
             }
             return JSON.stringify(names);
         })()"#
-        .to_string();
+            .to_string();
         (js, prefix.to_string())
     };
 
@@ -251,12 +255,15 @@ pub fn complete_script(prefix: &str) -> Vec<String> {
         None => {
             result.free(engine.context().as_ptr());
             return vec![];
-        },
+        }
     };
     result.free(engine.context().as_ptr());
 
     // Parse the JSON array manually (avoid pulling in serde just for this)
-    let trimmed = json_str.trim().trim_start_matches('[').trim_end_matches(']');
+    let trimmed = json_str
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
     if trimmed.is_empty() {
         return vec![];
     }
@@ -266,7 +273,11 @@ pub fn complete_script(prefix: &str) -> Vec<String> {
         .split(',')
         .filter_map(|s| {
             let s = s.trim().trim_matches('"');
-            if s.is_empty() { None } else { Some(s.to_string()) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
         })
         .filter(|name| name.to_lowercase().starts_with(&prop_lower))
         .collect();

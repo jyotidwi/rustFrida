@@ -12,8 +12,8 @@ use std::mem::size_of_val;
 use std::path::Path;
 use std::process;
 
+use crate::log_success;
 use crate::types::UserRegs;
-use crate::{log_success};
 
 /// 获取指定库的基址
 ///
@@ -46,7 +46,11 @@ pub(crate) fn get_lib_base(pid: Option<i32>, lib_name: &str) -> Result<usize, St
         }
     }
 
-    Err(format!("未找到进程 {} 的{}加载地址", pid.unwrap_or(-1), lib_name))
+    Err(format!(
+        "未找到进程 {} 的{}加载地址",
+        pid.unwrap_or(-1),
+        lib_name
+    ))
 }
 
 pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
@@ -63,7 +67,7 @@ pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
                 }
                 other => Err(format!("waitpid 状态异常: {:?}", other)),
             }
-        },
+        }
         Err(errno) => {
             let err_msg = match errno {
                 Errno::EPERM => "权限不足，请使用root权限运行",
@@ -129,7 +133,12 @@ fn set_registers(pid: i32, regs: &UserRegs) -> Result<(), String> {
 /// # 返回值
 /// * `Ok(usize)` - 函数返回值
 /// * `Err(String)` - 错误信息
-pub(crate) fn call_target_function(pid: i32, func_addr: usize, args: &[usize], debug: Option<bool>) -> Result<usize, String> {
+pub(crate) fn call_target_function(
+    pid: i32,
+    func_addr: usize,
+    args: &[usize],
+    debug: Option<bool>,
+) -> Result<usize, String> {
     // 获取当前寄存器状态
     let orig_regs = get_registers(pid)?;
 
@@ -146,7 +155,7 @@ pub(crate) fn call_target_function(pid: i32, func_addr: usize, args: &[usize], d
     }
 
     // 设置返回地址为 0x340
-    new_regs.regs[30] = 0x340;  // X30 是链接寄存器 (LR)
+    new_regs.regs[30] = 0x340; // X30 是链接寄存器 (LR)
 
     // 设置 PC 指向函数地址
     new_regs.pc = func_addr as u64;
@@ -159,17 +168,12 @@ pub(crate) fn call_target_function(pid: i32, func_addr: usize, args: &[usize], d
         let _ = ptrace::cont(Pid::from_raw(pid), Some(Signal::SIGSTOP));
         process::exit(1);
     }
-    let result = unsafe {
-        libc::ptrace(
-            PTRACE_CONT as c_int,
-            pid as pid_t,
-            0,
-            0
-        )
-    };
+    let result = unsafe { libc::ptrace(PTRACE_CONT as c_int, pid as pid_t, 0, 0) };
 
     if result == -1 {
-        return Err(format!("继续执行失败，错误码: {}", unsafe { *libc::__errno() }));
+        return Err(format!("继续执行失败，错误码: {}", unsafe {
+            *libc::__errno()
+        }));
     }
 
     // 等待进程停止
@@ -190,7 +194,7 @@ pub(crate) fn call_target_function(pid: i32, func_addr: usize, args: &[usize], d
             } else {
                 Err(format!("函数执行异常，PC = 0x{:x}", regs.pc))
             }
-        },
+        }
         status => Err(format!("进程异常停止: {:?}", status)),
     }
 }
@@ -216,7 +220,7 @@ fn write_remote_mem(pid: i32, addr: usize, data: *const u8, size: usize) -> Resu
             std::ptr::copy_nonoverlapping(
                 data.add(offset),
                 &mut word as *mut u64 as *mut u8,
-                write_size
+                write_size,
             );
         }
 
@@ -232,7 +236,10 @@ fn write_remote_mem(pid: i32, addr: usize, data: *const u8, size: usize) -> Resu
 
         if result == -1 {
             let errno = unsafe { *libc::__errno() };
-            return Err(format!("写入内存失败 addr=0x{:x} offset={} size={} errno={}", addr, offset, size, errno));
+            return Err(format!(
+                "写入内存失败 addr=0x{:x} offset={} size={} errno={}",
+                addr, offset, size, errno
+            ));
         }
 
         offset += write_size;
@@ -248,12 +255,7 @@ fn write_remote_mem(pid: i32, addr: usize, data: *const u8, size: usize) -> Resu
 /// * `addr` - 目标地址
 /// * `data` - 要写入的数据（任意类型）
 pub(crate) fn write_memory<T>(pid: i32, addr: usize, data: &T) -> Result<(), String> {
-    write_remote_mem(
-        pid,
-        addr,
-        data as *const T as *const u8,
-        size_of_val(data),
-    )
+    write_remote_mem(pid, addr, data as *const T as *const u8, size_of_val(data))
 }
 
 /// 向远程进程内存写入字节数组
@@ -263,10 +265,5 @@ pub(crate) fn write_memory<T>(pid: i32, addr: usize, data: &T) -> Result<(), Str
 /// * `addr` - 目标地址
 /// * `data` - 要写入的字节数组
 pub(crate) fn write_bytes(pid: i32, addr: usize, data: &[u8]) -> Result<(), String> {
-    write_remote_mem(
-        pid,
-        addr,
-        data.as_ptr(),
-        data.len(),
-    )
+    write_remote_mem(pid, addr, data.as_ptr(), data.len())
 }

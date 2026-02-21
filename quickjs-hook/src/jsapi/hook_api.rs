@@ -3,8 +3,8 @@
 use crate::context::JSContext;
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
-use crate::value::JSValue;
 use crate::jsapi::ptr::get_native_pointer_addr;
+use crate::value::JSValue;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::Mutex;
@@ -30,15 +30,17 @@ fn hook_error_message(code: i32) -> &'static [u8] {
         HOOK_ERROR_MPROTECT_FAILED => b"mprotect failed: cannot change memory protection\0",
         HOOK_ERROR_NOT_FOUND => b"hook not found at address\0",
         HOOK_ERROR_BUFFER_TOO_SMALL => b"buffer too small for jump instruction\0",
-        HOOK_ERROR_WXSHADOW_FAILED => b"wxshadow prctl failed: kernel may not support shadow pages\0",
+        HOOK_ERROR_WXSHADOW_FAILED => {
+            b"wxshadow prctl failed: kernel may not support shadow pages\0"
+        }
         _ => b"unknown hook error\0",
     }
 }
 
 /// Stored hook callback data - stores raw bytes to avoid Send/Sync issues
 struct HookData {
-    ctx: usize,  // Store as usize to avoid Send/Sync issues
-    callback_bytes: [u8; 16],  // JSValue is 16 bytes (u64 + i64)
+    ctx: usize,               // Store as usize to avoid Send/Sync issues
+    callback_bytes: [u8; 16], // JSValue is 16 bytes (u64 + i64)
 }
 
 // SAFETY: HookData only contains Copy types now (usize, [u8; 16])
@@ -82,7 +84,8 @@ unsafe extern "C" fn hook_callback_wrapper(
 
     let ctx = hook_data.ctx as *mut ffi::JSContext;
     // Reconstruct JSValue from bytes
-    let callback: ffi::JSValue = std::ptr::read(hook_data.callback_bytes.as_ptr() as *const ffi::JSValue);
+    let callback: ffi::JSValue =
+        std::ptr::read(hook_data.callback_bytes.as_ptr() as *const ffi::JSValue);
 
     // Create context object for JS callback
     let js_ctx = ffi::JS_NewObject(ctx);
@@ -153,7 +156,10 @@ unsafe extern "C" fn js_hook(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 2 {
-        return ffi::JS_ThrowTypeError(ctx, b"hook() requires at least 2 arguments\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"hook() requires at least 2 arguments\0".as_ptr() as *const _,
+        );
     }
 
     let ptr_arg = JSValue(*argv);
@@ -174,14 +180,22 @@ unsafe extern "C" fn js_hook(
             // Try to convert directly
             match ptr_arg.to_u64(ctx) {
                 Some(a) => a,
-                None => return ffi::JS_ThrowTypeError(ctx, b"hook() first argument must be a pointer\0".as_ptr() as *const _),
+                None => {
+                    return ffi::JS_ThrowTypeError(
+                        ctx,
+                        b"hook() first argument must be a pointer\0".as_ptr() as *const _,
+                    )
+                }
             }
         }
     };
 
     // Check callback is a function
     if !callback_arg.is_function(ctx) {
-        return ffi::JS_ThrowTypeError(ctx, b"hook() second argument must be a function\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"hook() second argument must be a function\0".as_ptr() as *const _,
+        );
     }
 
     // Initialize registry
@@ -195,23 +209,26 @@ unsafe extern "C" fn js_hook(
     std::ptr::copy_nonoverlapping(
         &callback_dup as *const ffi::JSValue as *const u8,
         callback_bytes.as_mut_ptr(),
-        16
+        16,
     );
 
     {
         let mut guard = HOOK_REGISTRY.lock().unwrap();
         let registry = guard.as_mut().unwrap();
-        registry.insert(addr, HookData {
-            ctx: ctx as usize,
-            callback_bytes,
-        });
+        registry.insert(
+            addr,
+            HookData {
+                ctx: ctx as usize,
+                callback_bytes,
+            },
+        );
     }
 
     // Install the hook
     let result = hook_ffi::hook_attach(
         addr as *mut std::ffi::c_void,
         Some(hook_callback_wrapper),
-        None, // No on_leave callback for now
+        None,                          // No on_leave callback for now
         addr as *mut std::ffi::c_void, // Use address as user_data to look up callback
         if stealth { 1 } else { 0 },
     );
@@ -221,7 +238,8 @@ unsafe extern "C" fn js_hook(
         let mut guard = HOOK_REGISTRY.lock().unwrap();
         if let Some(registry) = guard.as_mut() {
             if let Some(data) = registry.remove(&addr) {
-                let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
+                let callback: ffi::JSValue =
+                    std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
                 ffi::qjs_free_value(ctx, callback);
             }
         }
@@ -248,12 +266,15 @@ unsafe extern "C" fn js_unhook(
     // Get the address
     let addr = match get_native_pointer_addr(ctx, ptr_arg) {
         Some(a) => a,
-        None => {
-            match ptr_arg.to_u64(ctx) {
-                Some(a) => a,
-                None => return ffi::JS_ThrowTypeError(ctx, b"unhook() argument must be a pointer\0".as_ptr() as *const _),
+        None => match ptr_arg.to_u64(ctx) {
+            Some(a) => a,
+            None => {
+                return ffi::JS_ThrowTypeError(
+                    ctx,
+                    b"unhook() argument must be a pointer\0".as_ptr() as *const _,
+                )
             }
-        }
+        },
     };
 
     // Remove from registry and free callback
@@ -262,7 +283,8 @@ unsafe extern "C" fn js_unhook(
         if let Some(registry) = guard.as_mut() {
             if let Some(data) = registry.remove(&addr) {
                 let ctx = data.ctx as *mut ffi::JSContext;
-                let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
+                let callback: ffi::JSValue =
+                    std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
                 ffi::qjs_free_value(ctx, callback);
             }
         }
@@ -306,7 +328,8 @@ pub fn cleanup_hooks() {
             unsafe {
                 hook_ffi::hook_remove(addr as *mut std::ffi::c_void);
                 let ctx = data.ctx as *mut ffi::JSContext;
-                let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
+                let callback: ffi::JSValue =
+                    std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
                 ffi::qjs_free_value(ctx, callback);
             }
         }

@@ -308,7 +308,15 @@ impl VM {
         priority: i32,
     ) -> CallbackId {
         unsafe {
-            ffi::qbdi_addCodeRangeCB(self.instance, start, end, position, callback, data, priority)
+            ffi::qbdi_addCodeRangeCB(
+                self.instance,
+                start,
+                end,
+                position,
+                callback,
+                data,
+                priority,
+            )
         }
     }
 
@@ -346,9 +354,7 @@ impl VM {
         data: *mut c_void,
         priority: i32,
     ) -> CallbackId {
-        unsafe {
-            ffi::qbdi_addMemAccessCB(self.instance, access_type, callback, data, priority)
-        }
+        unsafe { ffi::qbdi_addMemAccessCB(self.instance, access_type, callback, data, priority) }
     }
 
     /// Add a callback for memory access at a specific address

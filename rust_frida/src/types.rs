@@ -1,14 +1,14 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
 use libc::{
-    close, connect, dlopen, dlsym, dlerror, free, malloc, memcpy, mmap, mprotect, munmap,
-    pthread_create, pthread_detach, recvmsg, snprintf, socket, strlen, write, c_void,
+    c_void, close, connect, dlerror, dlopen, dlsym, free, malloc, memcpy, mmap, mprotect, munmap,
+    pthread_create, pthread_detach, recvmsg, snprintf, socket, strlen, write,
 };
-use std::os::raw::c_int;
 use paste::paste;
+use std::os::raw::c_int;
 
+use crate::log_step;
 use crate::process::{call_target_function, write_bytes, write_memory};
-use crate::{log_step};
 
 extern "C" {
     fn android_dlopen_ext(
@@ -162,36 +162,36 @@ define_string_table!(
 
 // 使用宏定义函数列表
 define_libc_functions!(
-    malloc,    // 用于分配内存
-    free,      // 用于释放内存
-    socket,    // 用于创建套接字
-    connect,   // 用于连接套接字
-    write,     // 用于发送数据
-    close,     // 用于关闭套接字
-    mprotect,  // 用于设置内存保护
-    mmap,      // 用于内存映射
-    munmap,    // 用于释放内存映射
-    recvmsg,    // 用于接收文件描述符
+    malloc,   // 用于分配内存
+    free,     // 用于释放内存
+    socket,   // 用于创建套接字
+    connect,  // 用于连接套接字
+    write,    // 用于发送数据
+    close,    // 用于关闭套接字
+    mprotect, // 用于设置内存保护
+    mmap,     // 用于内存映射
+    munmap,   // 用于释放内存映射
+    recvmsg,  // 用于接收文件描述符
     pthread_create,
     pthread_detach,
-    snprintf,    // 用于格式化字符串
+    snprintf, // 用于格式化字符串
     memcpy,
     strlen
 );
 
 define_dl_functions!(
-    dlopen,    // 动态加载
-    dlsym,      // 动态符号查找
+    dlopen, // 动态加载
+    dlsym,  // 动态符号查找
     dlerror,
-    android_dlopen_ext  // fd-based dlopen (绕过 SELinux)
+    android_dlopen_ext // fd-based dlopen (绕过 SELinux)
 );
 
 /// 用户空间寄存器结构体
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct UserRegs {
-    pub(crate) regs: [u64; 31],      // X0-X30 寄存器
-    pub(crate) sp: u64,             // SP 栈指针
-    pub(crate) pc: u64,             // PC 程序计数器
-    pub(crate) pstate: u64,         // 处理器状态
+    pub(crate) regs: [u64; 31], // X0-X30 寄存器
+    pub(crate) sp: u64,         // SP 栈指针
+    pub(crate) pc: u64,         // PC 程序计数器
+    pub(crate) pstate: u64,     // 处理器状态
 }

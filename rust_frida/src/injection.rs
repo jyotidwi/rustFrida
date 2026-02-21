@@ -8,20 +8,26 @@ use std::ffi::CString;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
 
-use crate::types::{LibcOffsets, DlOffsets, write_string_table};
-use crate::process::{get_lib_base, attach_to_process, call_target_function, write_memory, write_bytes};
-use crate::{log_info, log_step, log_success, log_error, log_warn, log_addr};
+use crate::process::{
+    attach_to_process, call_target_function, get_lib_base, write_bytes, write_memory,
+};
+use crate::types::{write_string_table, DlOffsets, LibcOffsets};
+use crate::{log_addr, log_error, log_info, log_step, log_success, log_warn};
 
 // 嵌入loader.bin
 pub(crate) const SHELLCODE: &[u8] = include_bytes!("../../loader/build/loader.bin");
 
-pub(crate) const AGENT_SO: &[u8] = include_bytes!("../../target/aarch64-linux-android/debug/libagent.so");
+pub(crate) const AGENT_SO: &[u8] =
+    include_bytes!("../../target/aarch64-linux-android/debug/libagent.so");
 
 pub(crate) fn create_memfd_with_data(name: &str, data: &[u8]) -> Result<RawFd, String> {
     let cname = CString::new(name).unwrap();
     let fd = unsafe { memfd_create(cname.as_ptr(), MFD_CLOEXEC) };
     if fd < 0 {
-        return Err(format!("memfd_create 失败: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "memfd_create 失败: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // 写入数据
     let mut written = 0;
@@ -35,7 +41,10 @@ pub(crate) fn create_memfd_with_data(name: &str, data: &[u8]) -> Result<RawFd, S
         };
         if ret < 0 {
             unsafe { close(fd) };
-            return Err(format!("memfd 写入失败: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "memfd 写入失败: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         written += ret as usize;
     }
@@ -43,7 +52,10 @@ pub(crate) fn create_memfd_with_data(name: &str, data: &[u8]) -> Result<RawFd, S
 }
 
 /// 注入 agent 到目标进程
-pub(crate) fn inject_to_process(pid: i32, string_overrides: &std::collections::HashMap<String, String>) -> Result<(), String> {
+pub(crate) fn inject_to_process(
+    pid: i32,
+    string_overrides: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
     log_info!("正在附加到进程 PID: {}", pid);
 
     // 获取自身和目标进程的 libc / libdl 基址
@@ -84,8 +96,10 @@ pub(crate) fn inject_to_process(pid: i32, string_overrides: &std::collections::H
             mmap_flags as usize,
             !0usize, // fd = -1
             0,       // offset = 0
-        ], None
-    ).map_err(|e| format!("调用 mmap 失败: {}", e))?;
+        ],
+        None,
+    )
+    .map_err(|e| format!("调用 mmap 失败: {}", e))?;
 
     log_step!("分配shellcode内存");
     log_addr!("地址", shellcode_addr);
@@ -126,18 +140,19 @@ pub(crate) fn inject_to_process(pid: i32, string_overrides: &std::collections::H
     log_addr!("地址", string_table_addr);
 
     // 使用 call_target_function 调用 shellcode
-    match call_target_function(pid, shellcode_addr, &[offsets_addr, dloffset_addr, string_table_addr], None) {
+    match call_target_function(
+        pid,
+        shellcode_addr,
+        &[offsets_addr, dloffset_addr, string_table_addr],
+        None,
+    ) {
         Ok(return_value) => {
             log_success!("Shellcode 执行完成，返回值: 0x{:x}", return_value as isize);
 
             // 释放shellcode内存
             log_info!("正在释放shellcode内存...");
-            match call_target_function(
-                pid,
-                offsets.munmap,
-                &[shellcode_addr, shellcode_len],
-                None
-            ) {
+            match call_target_function(pid, offsets.munmap, &[shellcode_addr, shellcode_len], None)
+            {
                 Ok(_) => log_success!("Shellcode内存释放成功"),
                 Err(e) => log_error!("释放shellcode内存失败: {}", e),
             }
@@ -149,7 +164,7 @@ pub(crate) fn inject_to_process(pid: i32, string_overrides: &std::collections::H
                 log_success!("已分离目标进程");
             }
             Ok(())
-        },
+        }
         Err(e) => {
             log_error!("执行 shellcode 失败: {}", e);
             log_warn!("暂停目标进程，等待调试器附加...");
@@ -188,14 +203,17 @@ fn find_data_dir_by_uid(uid: u32) -> Option<String> {
 }
 
 /// 使用 eBPF 监听 SO 加载并自动附加
-pub(crate) fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>, string_overrides: &std::collections::HashMap<String, String>) -> Result<(), String> {
+pub(crate) fn watch_and_inject(
+    so_pattern: &str,
+    timeout_secs: Option<u64>,
+    string_overrides: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
     use ldmonitor::DlopenMonitor;
     use std::time::Duration;
 
     log_info!("正在启动 eBPF 监听器，等待加载: {}", so_pattern);
 
-    let monitor = DlopenMonitor::new(None)
-        .map_err(|e| format!("启动 eBPF 监听失败: {}", e))?;
+    let monitor = DlopenMonitor::new(None).map_err(|e| format!("启动 eBPF 监听失败: {}", e))?;
 
     let info = if let Some(secs) = timeout_secs {
         log_step!("超时时间: {} 秒", secs);
@@ -212,13 +230,28 @@ pub(crate) fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>, stri
             let pid = dlopen_info.pid();
             if let Some(ns_pid) = dlopen_info.ns_pid {
                 if ns_pid != dlopen_info.host_pid {
-                    log_success!("检测到 SO 加载: pid={} (host_pid={}), uid={}, path={}",
-                        ns_pid, dlopen_info.host_pid, dlopen_info.uid, dlopen_info.path);
+                    log_success!(
+                        "检测到 SO 加载: pid={} (host_pid={}), uid={}, path={}",
+                        ns_pid,
+                        dlopen_info.host_pid,
+                        dlopen_info.uid,
+                        dlopen_info.path
+                    );
                 } else {
-                    log_success!("检测到 SO 加载: pid={}, uid={}, path={}", pid, dlopen_info.uid, dlopen_info.path);
+                    log_success!(
+                        "检测到 SO 加载: pid={}, uid={}, path={}",
+                        pid,
+                        dlopen_info.uid,
+                        dlopen_info.path
+                    );
                 }
             } else {
-                log_success!("检测到 SO 加载: host_pid={}, uid={}, path={}", dlopen_info.host_pid, dlopen_info.uid, dlopen_info.path);
+                log_success!(
+                    "检测到 SO 加载: host_pid={}, uid={}, path={}",
+                    dlopen_info.host_pid,
+                    dlopen_info.uid,
+                    dlopen_info.path
+                );
             }
 
             // 克隆 string_overrides 以便修改
@@ -234,6 +267,6 @@ pub(crate) fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>, stri
 
             inject_to_process(pid as i32, &overrides)
         }
-        None => Err("监听超时，未检测到匹配的 SO 加载".to_string())
+        None => Err("监听超时，未检测到匹配的 SO 加载".to_string()),
     }
 }

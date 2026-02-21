@@ -54,7 +54,13 @@ macro_rules! log_step {
 #[macro_export]
 macro_rules! log_addr {
     ($label:expr, $addr:expr) => {{
-        println!("     {}: {}0x{:x}{}", $label, $crate::logger::DIM, $addr, $crate::logger::RESET);
+        println!(
+            "     {}: {}0x{:x}{}",
+            $label,
+            $crate::logger::DIM,
+            $addr,
+            $crate::logger::RESET
+        );
     }};
 }
 

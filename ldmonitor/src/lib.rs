@@ -235,7 +235,7 @@ async fn run_monitor(
     program.load()?;
     program.attach(
         Some("android_dlopen_ext"),
-        0,  // offset
+        0, // offset
         "/apex/com.android.runtime/lib64/bionic/libdl.so",
         target_pid.map(|p| p as i32),
     )?;

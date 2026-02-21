@@ -11,12 +11,12 @@ use prost::Message;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::ptr::null_mut;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::ffi::CString;
 
 // Android log priority levels
 const ANDROID_LOG_INFO: i32 = 4;
@@ -186,7 +186,15 @@ fn parse_maps_line(line: &str) -> Option<(u64, u64, String, u64, String, u64, St
         String::new()
     };
 
-    Some((start_addr, end_addr, permissions, offset, dev, inode, pathname))
+    Some((
+        start_addr,
+        end_addr,
+        permissions,
+        offset,
+        dev,
+        inode,
+        pathname,
+    ))
 }
 
 const MEMORY_CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -231,9 +239,11 @@ fn write_memory_region_chunked<W: Write>(
         };
 
         let mut region_buf = Vec::with_capacity(chunk_size + 256);
-        region.encode_length_delimited(&mut region_buf).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Region 编码失败: {}", e))
-        })?;
+        region
+            .encode_length_delimited(&mut region_buf)
+            .map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("Region 编码失败: {}", e))
+            })?;
         output.write_all(&region_buf)?;
 
         current_addr = chunk_end;
@@ -253,9 +263,22 @@ fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
     let mut regions_to_dump: Vec<(u64, u64, String, u64, String, u64, String)> = Vec::new();
     for line in reader.lines() {
         let line = line?;
-        if let Some((start_addr, end_addr, permissions, offset, dev, inode, pathname)) = parse_maps_line(&line) {
-            if ((pathname.contains(".so") && pathname.contains("/data")) || pathname.contains("base.apk")) && permissions.contains('r') {
-                regions_to_dump.push((start_addr, end_addr, permissions, offset, dev, inode, pathname));
+        if let Some((start_addr, end_addr, permissions, offset, dev, inode, pathname)) =
+            parse_maps_line(&line)
+        {
+            if ((pathname.contains(".so") && pathname.contains("/data"))
+                || pathname.contains("base.apk"))
+                && permissions.contains('r')
+            {
+                regions_to_dump.push((
+                    start_addr,
+                    end_addr,
+                    permissions,
+                    offset,
+                    dev,
+                    inode,
+                    pathname,
+                ));
             }
         }
     }
@@ -279,9 +302,11 @@ fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
         region_count: regions_to_dump.len() as u32,
     };
     let mut header_buf = Vec::new();
-    header.encode_length_delimited(&mut header_buf).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("Header 编码失败: {}", e))
-    })?;
+    header
+        .encode_length_delimited(&mut header_buf)
+        .map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("Header 编码失败: {}", e))
+        })?;
     output_file.write_all(&header_buf)?;
 
     for (start_addr, end_addr, permissions, offset, _dev, _inode, pathname) in regions_to_dump {
@@ -293,7 +318,10 @@ fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
             offset,
             &pathname,
         ) {
-            log_msg(format!("写入内存区域失败 0x{:x}-0x{:x}: {}", start_addr, end_addr, e));
+            log_msg(format!(
+                "写入内存区域失败 0x{:x}-0x{:x}: {}",
+                start_addr, end_addr, e
+            ));
             continue;
         }
     }
@@ -305,18 +333,15 @@ fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
 /// 获取全局 Stalker
 #[inline]
 pub fn get_stalker() -> &'static mut Stalker {
-    let cell = GLOBAL_STALKER.get_or_init(|| {
-        StalkerCell(UnsafeCell::new(Stalker::new(&GUM)))
-    });
+    let cell = GLOBAL_STALKER.get_or_init(|| StalkerCell(UnsafeCell::new(Stalker::new(&GUM))));
     unsafe { &mut *cell.0.get() }
 }
 
 /// 获取全局 Interceptor
 #[inline]
 pub fn get_interceptor() -> &'static mut Interceptor {
-    let cell = GLOBAL_INTERCEPTOR.get_or_init(|| {
-        InterceptorCell(UnsafeCell::new(Interceptor::obtain(&GUM)))
-    });
+    let cell = GLOBAL_INTERCEPTOR
+        .get_or_init(|| InterceptorCell(UnsafeCell::new(Interceptor::obtain(&GUM))));
     unsafe { &mut *cell.0.get() }
 }
 
@@ -350,18 +375,24 @@ impl EventSink for SampleEventSink {
     fn query_mask(&mut self) -> EventMask {
         EventMask::None
     }
-    fn start(&mut self) { println!("start"); }
-    fn process(&mut self, _event: &Event) { println!("process"); }
-    fn flush(&mut self) { println!("flush"); }
-    fn stop(&mut self) { println!("stop"); }
+    fn start(&mut self) {
+        println!("start");
+    }
+    fn process(&mut self, _event: &Event) {
+        println!("process");
+    }
+    fn flush(&mut self) {
+        println!("flush");
+    }
+    fn stop(&mut self) {
+        println!("stop");
+    }
 }
 
 pub fn spawn_memory_dump_thread(output_path: String) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        match dump_memory_snapshot(&output_path) {
-            Ok(_) => log_msg(format!("内存快照已保存到: {}\n", output_path)),
-            Err(e) => log_msg(format!("内存快照保存失败: {}\n", e)),
-        }
+    thread::spawn(move || match dump_memory_snapshot(&output_path) {
+        Ok(_) => log_msg(format!("内存快照已保存到: {}\n", output_path)),
+        Err(e) => log_msg(format!("内存快照保存失败: {}\n", e)),
     })
 }
 
@@ -389,14 +420,20 @@ pub fn follow(tid: usize) {
 
             if module_info.is_none() {
                 let (md_path, module_base, module_name) = match mdmap.find(addr) {
-                    Some(m) => (m.path().to_string(), m.range().base_address().0 as u64, m.name().to_string()),
+                    Some(m) => (
+                        m.path().to_string(),
+                        m.range().base_address().0 as u64,
+                        m.name().to_string(),
+                    ),
                     None => ("unknown".to_string(), 0u64, "unknown".to_string()),
                 };
 
-                should_trace = Some(!(md_path.contains("apex") ||
-                                     md_path.contains("system") ||
-                                     md_path.contains("unknown") ||
-                                     md_path.contains("memfd")));
+                should_trace = Some(
+                    !(md_path.contains("apex")
+                        || md_path.contains("system")
+                        || md_path.contains("unknown")
+                        || md_path.contains("memfd")),
+                );
 
                 module_info = Some((md_path, module_base, module_name));
             }
@@ -435,7 +472,10 @@ impl InvocationListener for OpenListener {
         log_msg(format!("oopps stalker {}", _context.thread_id()));
     }
     fn on_leave(&mut self, _context: InvocationContext) {
-        let _ = GLOBAL_STREAM.get().unwrap().write_all("end trace".as_bytes());
+        let _ = GLOBAL_STREAM
+            .get()
+            .unwrap()
+            .write_all("end trace".as_bytes());
         get_stalker().deactivate();
     }
 }
@@ -463,9 +503,7 @@ impl ProbeListener for Blistener {
 pub extern "C" fn replacecb(arg1: usize) -> usize {
     log_msg("start !".to_string());
     let original = *GLOBAL_ORIGINAL.get().unwrap();
-    let original_fn: extern "C" fn(usize) -> usize = unsafe {
-        std::mem::transmute(original)
-    };
+    let original_fn: extern "C" fn(usize) -> usize = unsafe { std::mem::transmute(original) };
     original_fn(arg1)
 }
 
@@ -483,11 +521,14 @@ pub fn hfollow(_lib: &str, addr: usize) {
     match interceptor.replace(
         NativePointer(target as *mut c_void),
         NativePointer(replacecb as *mut c_void),
-        NativePointer(null_mut())
+        NativePointer(null_mut()),
     ) {
         Ok(original) => {
             let _ = GLOBAL_ORIGINAL.set(original.0 as usize);
-            log_msg(format!("replace success, original trampoline: {:x}", original.0 as usize));
+            log_msg(format!(
+                "replace success, original trampoline: {:x}",
+                original.0 as usize
+            ));
         }
         Err(e) => {
             log_msg(format!("replace failed: {:?}", e));
