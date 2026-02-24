@@ -31,12 +31,21 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
         ];
         #[cfg(feature = "frida-gum")]
         {
-            v.push(("stalker", "[tid]", "Frida Stalker 追踪"));
-            v.push(("hfl", "<module> <offset>", "Interceptor hook 指定偏移"));
+            v.push(("stalker", "[tid]", "Frida Stalker 追踪 [frida-gum ✓]"));
+            v.push(("hfl", "<module> <offset>", "Interceptor hook 指定偏移 [frida-gum ✓]"));
+        }
+        #[cfg(not(feature = "frida-gum"))]
+        {
+            v.push(("stalker", "[tid]", "Frida Stalker 追踪 [需要 frida-gum]"));
+            v.push(("hfl", "<module> <offset>", "Interceptor hook 指定偏移 [需要 frida-gum]"));
         }
         #[cfg(feature = "qbdi")]
         {
-            v.push(("qfl", "<module> <offset>", "QBDI 追踪指定偏移"));
+            v.push(("qfl", "<module> <offset>", "QBDI 追踪指定偏移 [qbdi ✓]"));
+        }
+        #[cfg(not(feature = "qbdi"))]
+        {
+            v.push(("qfl", "<module> <offset>", "QBDI 追踪指定偏移 [需要 qbdi]"));
         }
         v
     })
@@ -230,6 +239,15 @@ pub(crate) fn print_help() {
             cmd, args, desc
         );
     }
+    println!();
+    println!("{BOLD}{CYAN}JavaScript API（在 loadjs/jseval/jsrepl 中可用）:{RESET}");
+    println!("{DIM}  console{RESET}      log/info/warn/error/debug");
+    println!("{DIM}  ptr(addr){RESET}    创建指针对象");
+    println!("{DIM}  Memory{RESET}       .readU8/16/32/64/Pointer/CString/Utf8String/ByteArray");
+    println!("{DIM}             {RESET}  .writeU8/16/32/64/Pointer");
+    println!("{DIM}  hook{RESET}         hook(target_ptr, replacement_ptr[, retval])");
+    println!("{DIM}  unhook{RESET}       unhook(target_ptr)");
+    println!("{DIM}  callNative{RESET}   callNative(addr, retType, argTypes, ...args)");
     println!();
 }
 

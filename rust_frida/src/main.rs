@@ -200,8 +200,9 @@ fn main() {
                     "等待 agent 连接超时 ({}s)，请检查:",
                     args.connect_timeout
                 );
-                log_error!("  1. dmesg | grep -i deny  （SELinux 拦截？）");
-                log_error!("  2. logcat | grep -E 'FATAL|crash'  （agent 崩溃？）");
+                log_warn!("  1. dmesg | grep -i 'deny\\|avc'  （SELinux 拦截？）");
+                log_warn!("  2. logcat | grep -E 'FATAL|crash'  （agent 崩溃？）");
+                log_warn!("  3. 使用 --verbose 重新运行查看详细日志");
                 std::process::exit(1);
             }
             std::thread::sleep(std::time::Duration::from_millis(500));

@@ -1,6 +1,6 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 fn parse_pid(s: &str) -> std::result::Result<i32, String> {
     match s.parse::<i32>() {
@@ -11,13 +11,18 @@ fn parse_pid(s: &str) -> std::result::Result<i32, String> {
 
 /// 命令行参数结构体
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about = "ARM64 Android 动态插桩工具，通过 ptrace 注入 agent.so，支持 QuickJS 脚本/inline hook/Frida Stalker",
+    long_about = None,
+    group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name"]))
+)]
 pub(crate) struct Args {
     /// 目标进程的PID（与 --watch-so、--name 互斥）
     #[arg(
         short,
         long,
-        required_unless_present_any = ["watch_so", "name"],
         conflicts_with_all = ["watch_so", "name"],
         allow_hyphen_values = true,
         value_parser = parse_pid
@@ -41,7 +46,16 @@ pub(crate) struct Args {
     pub(crate) connect_timeout: u64,
 
     /// 覆盖字符串表中的指定值（可多次使用），格式: name=value
-    /// 可用名称: socket_name, hello_msg, sym_name, pthread_err, dlsym_err, proc_path, cmdline, output_path
+    ///
+    /// 可用名称及用途:
+    ///   socket_name  — 抽象 Unix socket 名（默认: rust_frida_<PID>）
+    ///   hello_msg    — loader 握手消息（高级调试）
+    ///   sym_name     — loader 查找的导出符号（高级调试）
+    ///   pthread_err  — pthread 库错误消息前缀
+    ///   dlsym_err    — dlsym 调用错误消息前缀
+    ///   proc_path    — /proc/self/... 路径前缀
+    ///   cmdline      — procfs cmdline 路径
+    ///   output_path  — 日志输出路径
     #[arg(short = 's', long = "string", value_name = "NAME=VALUE")]
     pub(crate) strings: Vec<String>,
 

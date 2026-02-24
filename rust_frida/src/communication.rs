@@ -173,6 +173,10 @@ pub(crate) fn handle_socket_connection(stream: UnixStream) {
             Ok(_) => {}
             Err(e) => {
                 log_error!("读取连接失败: {}", e);
+                if e.kind() == std::io::ErrorKind::ConnectionReset {
+                    log_error!("可能原因: 目标进程权限不足 / agent 崩溃 / SELinux 拦截");
+                    log_error!("排查: dmesg | grep -i 'deny\\|avc'  或  logcat | grep -E 'FATAL|crash'");
+                }
                 break;
             }
         }

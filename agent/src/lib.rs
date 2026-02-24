@@ -760,7 +760,7 @@ fn process_cmd(command: &str) {
         }
         #[cfg(not(feature = "frida-gum"))]
         Some("hfl") | Some("stalker") => {
-            log_msg("[agent] 当前构建不支持该命令，需要 frida-gum feature\n".to_string());
+            log_msg("当前构建不支持该命令，需要 frida-gum feature\n".to_string());
         }
         #[cfg(feature = "qbdi")]
         Some("qfl") => {
@@ -783,7 +783,7 @@ fn process_cmd(command: &str) {
         }
         #[cfg(not(feature = "qbdi"))]
         Some("qfl") => {
-            log_msg("[agent] 当前构建不支持该命令，需要 qbdi feature\n".to_string());
+            log_msg("当前构建不支持该命令，需要 qbdi feature\n".to_string());
         }
         #[cfg(feature = "quickjs")]
         Some("jsinit") => {
