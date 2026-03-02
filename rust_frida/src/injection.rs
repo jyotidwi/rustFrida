@@ -3,15 +3,17 @@
 use libc::{c_void, close, memfd_create, write as libc_write, MFD_CLOEXEC};
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
+use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use nix::unistd::Pid;
 use std::ffi::CString;
+use std::io::IoSlice;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
 
 use crate::process::{
-    attach_to_process, call_target_function, get_lib_base, write_bytes, write_memory,
+    attach_to_process, call_target_function, get_lib_base, read_memory, write_bytes, write_memory,
 };
-use crate::types::{write_string_table, DlOffsets, LibcOffsets};
+use crate::types::{write_string_table, AgentArgs, DlOffsets, LibcOffsets};
 use crate::{log_error, log_info, log_success, log_verbose, log_verbose_addr, log_warn};
 
 // 嵌入loader.bin
@@ -69,11 +71,112 @@ fn alloc_and_write_struct<T>(pid: i32, malloc_addr: usize, data: &T, name: &str)
     Ok(addr)
 }
 
-/// 注入 agent 到目标进程
+/// 在目标进程中调用 socketpair()，返回 (fd0, fd1)
+fn create_socketpair_in_target(pid: i32, offsets: &LibcOffsets) -> Result<(i32, i32), String> {
+    // 在目标进程中分配 8 字节存放 int[2]
+    let sv_addr = call_target_function(pid, offsets.malloc, &[8], None)
+        .map_err(|e| format!("分配 socketpair 缓冲区失败: {}", e))?;
+
+    // 调用 socketpair(AF_UNIX=1, SOCK_STREAM=1, 0, sv_ptr)
+    let ret = call_target_function(
+        pid,
+        offsets.socketpair,
+        &[1, 1, 0, sv_addr],
+        None,
+    )
+    .map_err(|e| format!("调用 socketpair 失败: {}", e))?;
+
+    if ret as isize != 0 {
+        return Err(format!("socketpair 返回错误: {}", ret as isize));
+    }
+
+    // 读回 fd0, fd1
+    let sv: [i32; 2] = read_memory(pid, sv_addr)?;
+    log_verbose!("socketpair 创建成功: fd0={}, fd1={}", sv[0], sv[1]);
+
+    // 释放临时缓冲区
+    let _ = call_target_function(pid, offsets.free, &[sv_addr], None);
+
+    Ok((sv[0], sv[1]))
+}
+
+// aarch64 syscall numbers
+const SYS_PIDFD_OPEN: i64 = 434;
+const SYS_PIDFD_GETFD: i64 = 438;
+
+/// 通过 pidfd_getfd 从目标进程提取文件描述符到 host
+fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
+    // pidfd_open(pid, flags=0)
+    let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid, 0) };
+    if pidfd < 0 {
+        return Err(format!(
+            "pidfd_open({}) 失败: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // pidfd_getfd(pidfd, target_fd, flags=0)
+    let host_fd = unsafe { libc::syscall(SYS_PIDFD_GETFD, pidfd as i32, target_fd, 0u32) };
+    unsafe { close(pidfd as i32) };
+
+    if host_fd < 0 {
+        return Err(format!(
+            "pidfd_getfd(pid={}, fd={}) 失败: {}",
+            pid,
+            target_fd,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    log_verbose!("pidfd_getfd: pid={} target_fd={} → host_fd={}", pid, target_fd, host_fd);
+    Ok(host_fd as RawFd)
+}
+
+/// 通过已连接的 socket fd 发送文件描述符（sendmsg + SCM_RIGHTS）
+fn send_fd_raw(sock_fd: RawFd, fd_to_send: RawFd) -> Result<(), String> {
+    let data = b"AGENT_SO";
+    let iov = [IoSlice::new(data)];
+    let fds = [fd_to_send];
+    let cmsg = [ControlMessage::ScmRights(&fds)];
+    sendmsg::<()>(sock_fd, &iov, &cmsg, MsgFlags::empty(), None)
+        .map_err(|e| format!("发送文件描述符失败: {}", e))?;
+    Ok(())
+}
+
+/// RAII guard: 注入失败时自动关闭 host_fd 并 detach 目标进程
+struct InjectionGuard {
+    pid: i32,
+    host_fd: RawFd,
+    disarmed: bool,
+}
+
+impl InjectionGuard {
+    fn new(pid: i32, host_fd: RawFd) -> Self {
+        Self { pid, host_fd, disarmed: false }
+    }
+
+    /// 注入成功，取走 host_fd，不再自动清理
+    fn into_fd(mut self) -> RawFd {
+        self.disarmed = true;
+        self.host_fd
+    }
+}
+
+impl Drop for InjectionGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            unsafe { close(self.host_fd) };
+            let _ = ptrace::detach(Pid::from_raw(self.pid), None);
+        }
+    }
+}
+
+/// 注入 agent 到目标进程，返回 host_fd（socketpair 的 host 端）
 pub(crate) fn inject_to_process(
     pid: i32,
     string_overrides: &std::collections::HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<RawFd, String> {
     log_info!("正在附加到进程 PID: {}", pid);
 
     // 获取自身和目标进程的 libc / libdl 基址
@@ -99,6 +202,32 @@ pub(crate) fn inject_to_process(
 
     // 附加到目标进程
     attach_to_process(pid)?;
+
+    // === socketpair 通道建立 ===
+    // 1. 在目标进程中创建 socketpair
+    let (fd0, fd1) = create_socketpair_in_target(pid, &offsets)?;
+
+    // 2. 通过 pidfd_getfd 提取 fd0 到 host
+    let host_fd = extract_fd_from_target(pid, fd0)?;
+    // RAII guard: 后续任何 ? 返回都会自动 close(host_fd) + detach
+    let guard = InjectionGuard::new(pid, host_fd);
+
+    // 3. 在目标进程中关闭 fd0（host 已复制，目标只保留 fd1）
+    let _ = call_target_function(pid, offsets.close, &[fd0 as usize], None);
+    log_verbose!("目标进程 fd0={} 已关闭，fd1={} 保留给 agent", fd0, fd1);
+
+    // 4. 创建 memfd 并通过 socketpair 预发送 agent.so
+    let agent_memfd = create_memfd_with_data("wwb_so", AGENT_SO)?;
+    log_verbose!("已创建 agent.so memfd: {}", agent_memfd);
+    if let Err(e) = send_fd_raw(host_fd, agent_memfd) {
+        unsafe { close(agent_memfd) };
+        // guard 自动清理 host_fd + detach
+        return Err(format!("通过 socketpair 发送 agent.so 失败: {}", e));
+    }
+    unsafe { close(agent_memfd) };
+    log_verbose!("agent.so memfd 已通过 socketpair 发送");
+
+    // === 分配并写入注入数据 ===
     log_verbose!("开始分配内存");
 
     // 分配内存用于shellcode
@@ -138,11 +267,19 @@ pub(crate) fn inject_to_process(
     log_verbose!("字符串表写入成功");
     log_verbose_addr!("地址", string_table_addr);
 
-    // 使用 call_target_function 调用 shellcode
+    // 分配并写入 AgentArgs
+    let agent_args = AgentArgs {
+        table: string_table_addr as u64,
+        ctrl_fd: fd1,
+        _pad: 0,
+    };
+    let agent_args_addr = alloc_and_write_struct(pid, offsets.malloc, &agent_args, "AgentArgs")?;
+
+    // 使用 call_target_function 调用 shellcode（4 参数）
     match call_target_function(
         pid,
         shellcode_addr,
-        &[offsets_addr, dloffset_addr, string_table_addr],
+        &[offsets_addr, dloffset_addr, string_table_addr, agent_args_addr],
         None,
     ) {
         Ok(return_value) => {
@@ -156,18 +293,20 @@ pub(crate) fn inject_to_process(
                 Err(e) => log_error!("释放shellcode内存失败: {}", e),
             }
 
-            // detach 目标进程
+            // detach 目标进程（guard.into_fd 阻止自动 detach）
             if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {
                 log_error!("分离目标进程失败: {}", e);
             } else {
                 log_success!("已分离目标进程");
             }
-            Ok(())
+            Ok(guard.into_fd())
         }
         Err(e) => {
             log_error!("执行 shellcode 失败: {}", e);
             log_warn!("暂停目标进程，等待调试器附加...");
-            // 发送 SIGSTOP 让目标进程暂停
+            // 特殊处理：关闭 host_fd 但发 SIGSTOP（不走 guard 默认的 detach）
+            let fd = guard.into_fd();
+            unsafe { close(fd) };
             let _ = ptrace::cont(Pid::from_raw(pid), Some(Signal::SIGSTOP));
             Err(e)
         }
@@ -206,7 +345,7 @@ pub(crate) fn watch_and_inject(
     so_pattern: &str,
     timeout_secs: Option<u64>,
     string_overrides: &std::collections::HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<RawFd, String> {
     use ldmonitor::DlopenMonitor;
     use std::time::Duration;
 

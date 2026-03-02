@@ -11,15 +11,14 @@ mod types;
 use args::Args;
 use clap::Parser;
 use communication::{
-    check_agent_running, eval_state, start_socket_listener, AGENT_DISCONNECTED, AGENT_MEMFD,
-    AGENT_STAT, GLOBAL_SENDER,
+    eval_state, start_socketpair_handler, AGENT_DISCONNECTED, AGENT_STAT, GLOBAL_SENDER,
 };
-use injection::{create_memfd_with_data, inject_to_process, watch_and_inject, AGENT_SO};
+use injection::{inject_to_process, watch_and_inject};
 use crate::logger::{DIM, RESET};
-use libc::close;
 use repl::{print_eval_result, print_help, run_js_repl, CommandCompleter};
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
+use std::os::unix::io::RawFd;
 use std::sync::atomic::Ordering;
 use process::find_pid_by_name;
 use types::get_string_table_names;
@@ -31,19 +30,6 @@ fn main() {
 
     // 初始化 verbose 模式
     logger::VERBOSE.store(args.verbose, Ordering::Relaxed);
-
-    // 初始化 agent.so 的 memfd
-    match create_memfd_with_data("wwb_so", AGENT_SO) {
-        Ok(fd) => {
-            AGENT_MEMFD.store(fd, Ordering::SeqCst);
-            log_verbose!("已创建 agent.so memfd: {}", fd);
-            log_success!("agent.so 已就绪");
-        }
-        Err(e) => {
-            log_error!("创建 agent.so memfd 失败: {}", e);
-            std::process::exit(1);
-        }
-    }
 
     // 解析 --name 到 PID（如果指定）
     let target_pid: Option<i32> = if let Some(ref name) = args.name {
@@ -59,14 +45,6 @@ fn main() {
         }
     } else {
         args.pid
-    };
-
-    // 计算动态 socket 名（按目标 PID 或宿主 PID 区分实例，避免多实例冲突）
-    let socket_name = if let Some(pid) = target_pid {
-        format!("rust_frida_{}", pid)
-    } else {
-        // --watch-so: 目标 PID 注入时才知道，用宿主 PID 保证唯一性
-        format!("rust_frida_h{}", std::process::id())
     };
 
     // 解析字符串覆盖参数（格式：name=value）
@@ -97,39 +75,32 @@ fn main() {
         }
     }
 
-    // 自动写入动态 socket_name（用户未通过 --string 覆盖时）
-    if !string_overrides.contains_key("socket_name") {
-        string_overrides.insert("socket_name".to_string(), socket_name.clone());
-    }
-
-    // Fix #5: 注入前检测是否已有 agent 连接（另一个 rustfrida 实例正在运行）
-    if check_agent_running(&socket_name) {
-        log_warn!("警告: 检测到已有 agent 连接，目标进程可能已被注入！");
-        log_warn!("继续注入可能导致多个 agent 并存，建议先终止旧会话");
-    }
-
-    // 启动抽象套接字监听（失败立即退出，不执行后续注入）
-    let handle = start_socket_listener(&socket_name).unwrap_or_else(|e| {
-        log_error!("启动 socket 监听失败: {}", e);
-        std::process::exit(1);
-    });
-
-    // 根据参数选择注入方式
-    let result = if let Some(so_pattern) = &args.watch_so {
+    // 根据参数选择注入方式，返回 host_fd
+    let host_fd: RawFd = if let Some(so_pattern) = &args.watch_so {
         // 使用 eBPF 监听 SO 加载
-        watch_and_inject(so_pattern, args.timeout, &string_overrides)
+        match watch_and_inject(so_pattern, args.timeout, &string_overrides) {
+            Ok(fd) => fd,
+            Err(e) => {
+                log_error!("注入失败: {}", e);
+                std::process::exit(1);
+            }
+        }
     } else if let Some(pid) = target_pid {
         // 直接附加到指定 PID（来自 --pid 或 --name 解析结果）
-        inject_to_process(pid, &string_overrides)
+        match inject_to_process(pid, &string_overrides) {
+            Ok(fd) => fd,
+            Err(e) => {
+                log_error!("注入失败: {}", e);
+                std::process::exit(1);
+            }
+        }
     } else {
         log_error!("必须指定 --pid、--name 或 --watch-so");
         std::process::exit(1);
     };
 
-    if let Err(e) = result {
-        log_error!("注入失败: {}", e);
-        std::process::exit(1);
-    }
+    // 启动 socketpair handler（在 host_fd 上读写）
+    let handle = start_socketpair_handler(host_fd);
 
     // 等待 agent 连接，默认超时 30s（可通过 --connect-timeout 调整）
     {
@@ -286,15 +257,6 @@ fn main() {
 
     let _ = rl.save_history(".rustfrida_history");
 
-    // 通知监听线程退出（防止 agent 从未连接时 join 永久阻塞）
-    communication::STOP_LISTENER.store(true, Ordering::SeqCst);
-    // 等待监听线程退出
-    handle.join().unwrap();
-
-    // 清理资源
-    let memfd = AGENT_MEMFD.load(Ordering::SeqCst);
-    if memfd >= 0 {
-        unsafe { close(memfd) };
-        log_success!("已关闭 agent.so memfd");
-    }
+    // 等待 handler 线程退出（agent 关闭 socket 后 host 收到 EOF 自然退出）
+    let _ = handle.join();
 }

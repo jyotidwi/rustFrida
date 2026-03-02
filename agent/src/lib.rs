@@ -27,12 +27,14 @@ mod qbdi_trace;
 #[cfg(feature = "quickjs")]
 mod quickjs_loader;
 
-use crate::communication::{connect_socket, flush_cached_logs, log_msg, write_stream, GLOBAL_STREAM, SOCKET_NAME};
+use crate::communication::{flush_cached_logs, log_msg, shutdown_stream, write_stream, GLOBAL_STREAM};
 use crate::crash_handler::{install_crash_handlers, install_panic_hook};
 use libc::{c_int, kill, pid_t, SIGSTOP};
 use std::ffi::c_void;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::os::unix::io::FromRawFd;
+use std::os::unix::net::UnixStream;
 use std::ptr::null_mut;
 use std::process;
 use std::sync::OnceLock;
@@ -48,18 +50,12 @@ type Result<T> = std::result::Result<T, String>;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct StringTable {
-    pub socket_name: u64,
-    pub socket_name_len: u32,
-    pub hello_msg: u64,
-    pub hello_msg_len: u32,
     pub sym_name: u64,
     pub sym_name_len: u32,
     pub pthread_err: u64,
     pub pthread_err_len: u32,
     pub dlsym_err: u64,
     pub dlsym_err_len: u32,
-    pub proc_path: u64,
-    pub proc_path_len: u32,
     pub cmdline: u64,
     pub cmdline_len: u32,
     pub output_path: u64,
@@ -79,11 +75,6 @@ impl StringTable {
         String::from_utf8(slice[..end].to_vec()).ok()
     }
 
-    /// 获取 socket_name
-    pub unsafe fn get_socket_name(&self) -> Option<String> {
-        self.read_string(self.socket_name, self.socket_name_len)
-    }
-
     /// 获取 cmdline
     pub unsafe fn get_cmdline(&self) -> Option<String> {
         self.read_string(self.cmdline, self.cmdline_len)
@@ -98,30 +89,32 @@ impl StringTable {
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 pub static OUTPUT_PATH: OnceLock<String> = OnceLock::new();
 
+/// 注入参数结构体（与 rust_frida/src/types.rs 和 loader.c 完全一致）
+#[repr(C)]
+pub struct AgentArgs {
+    pub table: u64,    // *const StringTable（目标进程内地址）
+    pub ctrl_fd: i32,  // socketpair fd1（agent 端）
+    pub _pad: i32,     // 对齐填充
+}
+
 #[no_mangle]
-pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
+pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     // 安装Rust panic hook（需要在最前面，捕获Rust层面的panic）
     install_panic_hook();
     // 安装崩溃信号处理器（捕获SIGSEGV等信号）
     install_crash_handlers();
 
+    // 从 AgentArgs 读取 ctrl_fd 和 StringTable 指针
+    let (ctrl_fd, table) = unsafe {
+        let args = &*(args_ptr as *const AgentArgs);
+        (args.ctrl_fd, &*(args.table as *const StringTable))
+    };
+
     unsafe {
-        // 解析 StringTable 结构
-        let string_table = string_table as *const StringTable;
-        let table = &*string_table;
-
-        // 读取动态 socket 名（rust_frida_{pid}）并保存，connect_socket() 将使用它
-        if let Some(sock) = table.get_socket_name() {
-            if sock != "novalue" {
-                let _ = SOCKET_NAME.set(sock);
-            }
-        }
-
         // 读取 output_path 并保存到全局变量
         if let Some(output) = table.get_output_path() {
             if output != "novalue" {
                 let _ = OUTPUT_PATH.set(output.clone());
-                // log_msg(format!("Output path: {}\n", output));
             }
         }
 
@@ -138,10 +131,8 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
     }
 
-
-    // Connect and split into read/write halves so BufReader and Mutex-guarded writes
-    // can operate concurrently on the same full-duplex Unix socket.
-    let sock = connect_socket().expect("wwb connect socket failed!!!");
+    // 使用 ctrl_fd（socketpair 的 agent 端），已通过 socketpair 连接到 host
+    let sock = unsafe { UnixStream::from_raw_fd(ctrl_fd) };
     let write_half = sock.try_clone().expect("stream clone failed");
     GLOBAL_STREAM.set(std::sync::Mutex::new(write_half)).unwrap();
     write_stream(b"HELLO_AGENT\n");
@@ -174,6 +165,8 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
             }
         }
     }
+    // 关闭 socket，host 收到 EOF 自然退出
+    shutdown_stream();
     null_mut()
 }
 

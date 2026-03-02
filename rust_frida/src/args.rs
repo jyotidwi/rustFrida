@@ -59,12 +59,9 @@ pub(crate) struct Args {
     /// 覆盖字符串表中的指定值（可多次使用），格式: name=value
     ///
     /// 可用名称及用途:
-    ///   socket_name  — 抽象 Unix socket 名（默认: rust_frida_<PID>）
-    ///   hello_msg    — loader 握手消息（高级调试）
     ///   sym_name     — loader 查找的导出符号（高级调试）
     ///   pthread_err  — pthread 库错误消息前缀
     ///   dlsym_err    — dlsym 调用错误消息前缀
-    ///   proc_path    — /proc/self/... 路径前缀
     ///   cmdline      — procfs cmdline 路径
     ///   output_path  — 日志输出路径
     #[arg(short = 's', long = "string", value_name = "NAME=VALUE")]

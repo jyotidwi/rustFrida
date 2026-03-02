@@ -292,6 +292,65 @@ pub(crate) fn write_bytes(pid: i32, addr: usize, data: &[u8]) -> Result<(), Stri
     write_remote_mem(pid, addr, data.as_ptr(), data.len())
 }
 
+/// 从远程进程内存读取数据
+///
+/// # 参数
+/// * `pid` - 目标进程ID
+/// * `addr` - 目标地址
+/// * `size` - 读取字节数
+fn read_remote_mem(pid: i32, addr: usize, size: usize) -> Result<Vec<u8>, String> {
+    let addr = addr & 0x00FFFFFFFFFFFFFF; // 去掉 MTE 标签位
+    let mut result = vec![0u8; size];
+    let mut offset = 0;
+    while offset < size {
+        unsafe { *libc::__errno() = 0 };
+        let word = unsafe {
+            libc::ptrace(
+                libc::PTRACE_PEEKTEXT,
+                pid as pid_t,
+                (addr + offset) as *mut c_void,
+                std::ptr::null_mut::<c_void>(),
+            )
+        };
+        let errno_val = unsafe { *libc::__errno() };
+        if word == -1 && errno_val != 0 {
+            return Err(format!(
+                "读取内存失败(PEEKTEXT) addr=0x{:x} offset={} errno={}",
+                addr, offset, errno_val
+            ));
+        }
+        let remaining = size - offset;
+        let copy_size = remaining.min(8);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &word as *const i64 as *const u8,
+                result.as_mut_ptr().add(offset),
+                copy_size,
+            );
+        }
+        offset += 8;
+    }
+    Ok(result)
+}
+
+/// 从远程进程读取任意类型的数据
+///
+/// # 参数
+/// * `pid` - 目标进程ID
+/// * `addr` - 目标地址（目标进程中的内存地址）
+pub(crate) fn read_memory<T: Default>(pid: i32, addr: usize) -> Result<T, String> {
+    let bytes = read_remote_mem(pid, addr, std::mem::size_of::<T>())?;
+    let mut val = T::default();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            &mut val as *mut T as *mut u8,
+            std::mem::size_of::<T>(),
+        );
+    }
+    Ok(val)
+}
+
 /// 通过读 /proc/*/cmdline 按进程名查找 PID。
 /// 精确匹配（含末路径组件）；多匹配列出并返回错误。
 pub(crate) fn find_pid_by_name(name: &str) -> Result<i32, String> {

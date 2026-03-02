@@ -1,8 +1,8 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
 use libc::{
-    c_void, close, connect, dlerror, dlopen, dlsym, free, malloc, memcpy, mmap, mprotect, munmap,
-    pthread_create, pthread_detach, recvmsg, snprintf, socket, strlen, write,
+    c_void, close, dlerror, dlopen, dlsym, free, malloc, mmap, munmap,
+    pthread_create, pthread_detach, recvmsg, socketpair, strlen, write,
 };
 use paste::paste;
 use std::os::raw::c_int;
@@ -141,12 +141,9 @@ macro_rules! define_string_table {
 
 // 使用宏定义字符串表
 define_string_table!(
-    (socket_name, b"rust_frida_socket"),
-    (hello_msg, b"HELLO_LOADER\n"),
     (sym_name, b"hello_entry"),
     (pthread_err, b"pthreadded"),
     (dlsym_err, b"dlsymFail"),
-    (proc_path, b"/proc/self/fd/"),
     (cmdline, b"novalue"),
     (output_path, b"novalue"),
     // 未来添加字符串只需在这里添加新行即可
@@ -154,20 +151,16 @@ define_string_table!(
 
 // 使用宏定义函数列表
 define_libc_functions!(
-    malloc,   // 用于分配内存
-    free,     // 用于释放内存
-    socket,   // 用于创建套接字
-    connect,  // 用于连接套接字
-    write,    // 用于发送数据
-    close,    // 用于关闭套接字
-    mprotect, // 用于设置内存保护
-    mmap,     // 用于内存映射
-    munmap,   // 用于释放内存映射
-    recvmsg,  // 用于接收文件描述符
+    malloc,     // 用于分配内存
+    free,       // 用于释放内存
+    socketpair, // 用于创建已连接的套接字对
+    write,      // 用于发送数据
+    close,      // 用于关闭套接字
+    mmap,       // 用于内存映射
+    munmap,     // 用于释放内存映射
+    recvmsg,    // 用于接收文件描述符
     pthread_create,
     pthread_detach,
-    snprintf, // 用于格式化字符串
-    memcpy,
     strlen
 );
 
@@ -177,6 +170,16 @@ define_dl_functions!(
     dlerror,
     android_dlopen_ext // fd-based dlopen (绕过 SELinux)
 );
+
+/// 注入参数结构体，传递给 shellcode → agent
+/// ABI 关键：必须与 loader.c 和 agent/src/lib.rs 中的定义完全一致
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct AgentArgs {
+    pub(crate) table: u64,   // *const StringTable（目标进程内地址）
+    pub(crate) ctrl_fd: i32, // socketpair fd1（agent 端）
+    pub(crate) _pad: i32,    // 对齐填充
+}
 
 /// 用户空间寄存器结构体
 #[repr(C)]
