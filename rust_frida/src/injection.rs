@@ -1,12 +1,9 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-use libc::{c_void, close, memfd_create, write as libc_write, MFD_CLOEXEC};
+use libc::{c_void, close, write as libc_write};
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
-use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use nix::unistd::Pid;
-use std::ffi::CString;
-use std::io::IoSlice;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
 
@@ -26,37 +23,6 @@ pub(crate) const AGENT_SO: &[u8] =
 #[cfg(not(debug_assertions))]
 pub(crate) const AGENT_SO: &[u8] =
     include_bytes!("../../target/aarch64-linux-android/release/libagent.so");
-
-pub(crate) fn create_memfd_with_data(name: &str, data: &[u8]) -> Result<RawFd, String> {
-    let cname = CString::new(name).unwrap();
-    let fd = unsafe { memfd_create(cname.as_ptr(), MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(format!(
-            "memfd_create 失败: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // 写入数据
-    let mut written = 0;
-    while written < data.len() {
-        let ret = unsafe {
-            libc_write(
-                fd,
-                data[written..].as_ptr() as *const c_void,
-                data.len() - written,
-            )
-        };
-        if ret < 0 {
-            unsafe { close(fd) };
-            return Err(format!(
-                "memfd 写入失败: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        written += ret as usize;
-    }
-    Ok(fd)
-}
 
 /// 在目标进程中分配内存并写入结构体，返回远程地址。
 fn alloc_and_write_struct<T>(pid: i32, malloc_addr: usize, data: &T, name: &str) -> Result<usize, String> {
@@ -133,15 +99,27 @@ fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
     Ok(host_fd as RawFd)
 }
 
-/// 通过已连接的 socket fd 发送文件描述符（sendmsg + SCM_RIGHTS）
-fn send_fd_raw(sock_fd: RawFd, fd_to_send: RawFd) -> Result<(), String> {
-    let data = b"AGENT_SO";
-    let iov = [IoSlice::new(data)];
-    let fds = [fd_to_send];
-    let cmsg = [ControlMessage::ScmRights(&fds)];
-    sendmsg::<()>(sock_fd, &iov, &cmsg, MsgFlags::empty(), None)
-        .map_err(|e| format!("发送文件描述符失败: {}", e))?;
-    Ok(())
+/// 在目标进程中调用 memfd_create()，返回目标进程内的 fd 号
+fn create_memfd_in_target(pid: i32, offsets: &LibcOffsets) -> Result<i32, String> {
+    let name = b"jit-cache\0";
+    let name_addr = call_target_function(pid, offsets.malloc, &[name.len()], None)
+        .map_err(|e| format!("分配 memfd name 内存失败: {}", e))?;
+    write_bytes(pid, name_addr, name)?;
+
+    // 调用 memfd_create(name, flags=0)
+    let ret = call_target_function(pid, offsets.memfd_create, &[name_addr, 0], None)
+        .map_err(|e| format!("调用 memfd_create 失败: {}", e))?;
+
+    // 释放临时 name 缓冲区
+    let _ = call_target_function(pid, offsets.free, &[name_addr], None);
+
+    let fd = ret as i32;
+    if fd < 0 {
+        return Err(format!("memfd_create 返回错误: {}", fd));
+    }
+
+    log_verbose!("目标进程 memfd_create 成功: fd={}", fd);
+    Ok(fd)
 }
 
 /// RAII guard: 注入失败时自动关闭 host_fd 并 detach 目标进程
@@ -216,16 +194,34 @@ pub(crate) fn inject_to_process(
     let _ = call_target_function(pid, offsets.close, &[fd0 as usize], None);
     log_verbose!("目标进程 fd0={} 已关闭，fd1={} 保留给 agent", fd0, fd1);
 
-    // 4. 创建 memfd 并通过 socketpair 预发送 agent.so
-    let agent_memfd = create_memfd_with_data("wwb_so", AGENT_SO)?;
-    log_verbose!("已创建 agent.so memfd: {}", agent_memfd);
-    if let Err(e) = send_fd_raw(host_fd, agent_memfd) {
-        unsafe { close(agent_memfd) };
-        // guard 自动清理 host_fd + detach
-        return Err(format!("通过 socketpair 发送 agent.so 失败: {}", e));
+    // 4. 在目标进程中创建 memfd，pidfd_getfd 提取到 host，写入 agent.so
+    let target_memfd = create_memfd_in_target(pid, &offsets)?;
+    let host_memfd = extract_fd_from_target(pid, target_memfd)?;
+    log_verbose!("已提取目标 memfd: target_fd={} → host_fd={}", target_memfd, host_memfd);
+
+    // 写入 AGENT_SO 数据到 host_memfd
+    let mut written = 0usize;
+    while written < AGENT_SO.len() {
+        let ret = unsafe {
+            libc_write(
+                host_memfd,
+                AGENT_SO[written..].as_ptr() as *const c_void,
+                AGENT_SO.len() - written,
+            )
+        };
+        if ret >= 0 {
+            written += ret as usize;
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            unsafe { close(host_memfd) };
+            return Err(format!("写入 agent.so 到 memfd 失败: {}", err));
+        }
     }
-    unsafe { close(agent_memfd) };
-    log_verbose!("agent.so memfd 已通过 socketpair 发送");
+    unsafe { close(host_memfd) };
+    log_verbose!("agent.so ({} bytes) 已写入目标进程 memfd", AGENT_SO.len());
 
     // === 分配并写入注入数据 ===
     log_verbose!("开始分配内存");
@@ -271,7 +267,7 @@ pub(crate) fn inject_to_process(
     let agent_args = AgentArgs {
         table: string_table_addr as u64,
         ctrl_fd: fd1,
-        _pad: 0,
+        agent_memfd: target_memfd,
     };
     let agent_args_addr = alloc_and_write_struct(pid, offsets.malloc, &agent_args, "AgentArgs")?;
 
@@ -283,7 +279,27 @@ pub(crate) fn inject_to_process(
         None,
     ) {
         Ok(return_value) => {
-            log_verbose!("Shellcode 执行完成，返回值: 0x{:x}", return_value as isize);
+            // shellcode_entry 返回 int (32位)，ARM64 X0 高 32 位为 0，
+            // 需先截断为 i32 再符号扩展，否则 -3 变成 0x00000000FFFFFFFD
+            let ret = return_value as u32 as i32 as isize;
+            log_verbose!("Shellcode 执行完成，返回值: 0x{:x}", ret);
+
+            // 检查 shellcode 返回值（1 = 成功，负数 = 失败）
+            if ret != 1 {
+                let reason = match ret {
+                    -3 => "（已废弃，不应出现）",
+                    -5 => "android_dlopen_ext 失败（SO 加载失败）",
+                    -6 => "pthread_create 失败（无法创建 agent 线程）",
+                    -7 => "dlsym 失败（未找到 hello_entry 符号）",
+                    _ => "未知错误",
+                };
+                // 清理 shellcode 内存
+                let _ = call_target_function(pid, offsets.munmap, &[shellcode_addr, shellcode_len], None);
+                let _ = ptrace::detach(Pid::from_raw(pid), None);
+                let fd = guard.into_fd();
+                unsafe { close(fd) };
+                return Err(format!("Shellcode 执行失败 ({}): {}", ret, reason));
+            }
 
             // 释放shellcode内存
             log_verbose!("正在释放shellcode内存...");

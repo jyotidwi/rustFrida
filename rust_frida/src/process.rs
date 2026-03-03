@@ -169,35 +169,54 @@ pub(crate) fn call_target_function(
         let _ = ptrace::cont(Pid::from_raw(pid), Some(Signal::SIGSTOP));
         process::exit(1);
     }
-    let result = unsafe { libc::ptrace(PTRACE_CONT as c_int, pid as pid_t, 0, 0) };
 
-    if result == -1 {
-        return Err(format!("继续执行失败，错误码: {}", unsafe {
-            *libc::__errno()
-        }));
-    }
-
-    // 等待进程停止
     let target_pid = Pid::from_raw(pid);
-    match waitpid(target_pid, None).map_err(|e| format!("等待进程失败: {}", e))? {
-        WaitStatus::Stopped(_, Signal::SIGSEGV) => {
-            // 获取寄存器，检查 PC 是否为预期值
-            let regs = get_registers(pid)?;
 
-            if regs.pc == 0x340 {
-                // 函数执行完成，获取返回值（ARM64 使用 X0 寄存器返回值）
-                let return_value = regs.regs[0] as usize;
+    // 重试循环：处理 spawn 模式下的 pending SIGSTOP
+    // 子进程 raise(SIGSTOP) + ptrace attach 的 SIGSTOP 会产生 pending 信号，
+    // 导致 PTRACE_CONT 后进程立即被 SIGSTOP 再次停止。
+    // 遇到 SIGSTOP 时吞掉信号并重新 CONT，最多重试 3 次。
+    let max_sigstop_retries = 3;
+    for attempt in 0..=max_sigstop_retries {
+        let result = unsafe { libc::ptrace(PTRACE_CONT as c_int, pid as pid_t, 0, 0) };
 
-                // 恢复原始寄存器状态
-                set_registers(pid, &orig_regs)?;
-
-                Ok(return_value)
-            } else {
-                Err(format!("函数执行异常，PC = 0x{:x}", regs.pc))
-            }
+        if result == -1 {
+            return Err(format!("继续执行失败，错误码: {}", unsafe {
+                *libc::__errno()
+            }));
         }
-        status => Err(format!("进程异常停止: {:?}", status)),
+
+        // 等待进程停止
+        match waitpid(target_pid, None).map_err(|e| format!("等待进程失败: {}", e))? {
+            WaitStatus::Stopped(_, Signal::SIGSEGV) => {
+                // 获取寄存器，检查 PC 是否为预期值
+                let regs = get_registers(pid)?;
+
+                if regs.pc == 0x340 {
+                    // 函数执行完成，获取返回值（ARM64 使用 X0 寄存器返回值）
+                    let return_value = regs.regs[0] as usize;
+
+                    // 恢复原始寄存器状态
+                    set_registers(pid, &orig_regs)?;
+
+                    return Ok(return_value);
+                } else {
+                    return Err(format!("函数执行异常，PC = 0x{:x}", regs.pc));
+                }
+            }
+            WaitStatus::Stopped(_, Signal::SIGSTOP) => {
+                // spawn 模式下 pending SIGSTOP：吞掉信号，重新 CONT
+                if attempt < max_sigstop_retries {
+                    log_warn!("检测到 pending SIGSTOP (第{}次)，跳过并重试", attempt + 1);
+                    continue;
+                } else {
+                    return Err("多次 SIGSTOP 中断，无法执行目标函数".to_string());
+                }
+            }
+            status => return Err(format!("进程异常停止: {:?}", status)),
+        }
     }
+    Err("call_target_function: 超出重试次数".to_string())
 }
 
 /// 向远程进程内存写入任意类型的数据

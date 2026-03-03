@@ -94,7 +94,7 @@ pub static OUTPUT_PATH: OnceLock<String> = OnceLock::new();
 pub struct AgentArgs {
     pub table: u64,    // *const StringTable（目标进程内地址）
     pub ctrl_fd: i32,  // socketpair fd1（agent 端）
-    pub _pad: i32,     // 对齐填充
+    pub agent_memfd: i32, // 目标进程内的 agent.so memfd
 }
 
 #[no_mangle]
@@ -126,10 +126,7 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
         }
     }
 
-    unsafe {
-        let name = std::ffi::CString::new("wwb").unwrap();
-        libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
-    }
+    // 不设置线程名，保持继承的进程名，避免被安全 SDK 通过 /proc/self/task/*/comm 检测
 
     // 使用 ctrl_fd（socketpair 的 agent 端），已通过 socketpair 连接到 host
     let sock = unsafe { UnixStream::from_raw_fd(ctrl_fd) };

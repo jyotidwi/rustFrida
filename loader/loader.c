@@ -1,5 +1,5 @@
 #include <stdint.h>
-#include <sys/socket.h>
+#include <sys/types.h>
 #include <dlfcn.h>
 #include <pthread.h>
 
@@ -30,7 +30,7 @@ typedef struct {
     uintptr_t close;       // 用于关闭套接字
     uintptr_t mmap;        // 用于内存映射
     uintptr_t munmap;
-    uintptr_t recvmsg;     // 用于接收文件描述符
+    uintptr_t memfd_create; // 用于创建匿名内存文件
     uintptr_t pthread_create; // 用于创建线程
     uintptr_t pthread_detach; // 用于分离线程
     uintptr_t strlen;
@@ -47,7 +47,7 @@ typedef struct {
 typedef struct {
     uint64_t table;    // *const StringTable（目标进程内地址）
     int32_t  ctrl_fd;  // socketpair fd1（agent 端）
-    int32_t  _pad;     // 对齐填充
+    int32_t  agent_memfd; // 目标进程内的 agent.so memfd
 } AgentArgs;
 
 // 定义函数指针类型
@@ -68,14 +68,11 @@ typedef struct {
 } android_dlextinfo;
 typedef void* (*android_dlopen_ext_t)(const char*, int, const android_dlextinfo*);
 
-typedef ssize_t (*recvmsg_t)(int, struct msghdr*, int);
 typedef int (*pthread_create_t)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
 typedef int (*pthread_detach_t)(pthread_t);
 typedef void* (*dlsym_t)(void*, const char*);
 typedef char* (*dlerror_t)();
 typedef size_t (*strlen_t)(const char *);
-
-static int recv_fd(int sock, ssize_t (*recvmsg_fn)(int, struct msghdr*, int));
 
 int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, AgentArgs* agent_args) {
     // 定义函数指针
@@ -83,7 +80,6 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
     write_t write = (write_t)offsets->write;
     close_t close = (close_t)offsets->close;
     android_dlopen_ext_t android_dlopen_ext = (android_dlopen_ext_t)dl->android_dlopen_ext;
-    recvmsg_t recvmsg = (recvmsg_t)offsets->recvmsg;
     dlsym_t dlsym = (dlsym_t)dl->dlsym;
     dlerror_t dlerror = (dlerror_t)dl->dlerror;
     pthread_create_t pthread_create = (pthread_create_t)offsets->pthread_create;
@@ -100,18 +96,8 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
     const char* dlsym_err = (const char*)table->dlsym_err;
     size_t dlsym_err_len = table->dlsym_err_len - 1; // 减去 NULL 结尾
 
-    // 通过 socketpair 的 ctrl_fd 接收 agent.so 的 memfd
     int ctrl_fd = agent_args->ctrl_fd;
-
-    // 接收文件描述符（host 已通过 sendmsg 预发送）
-    int memfd = recv_fd(ctrl_fd, recvmsg);
-    if (memfd < 0) {
-        close(ctrl_fd);
-        free(offsets);
-        free(dl);
-        free(table);
-        return -3;
-    }
+    int memfd = agent_args->agent_memfd;
 
     // 使用 android_dlopen_ext fd-based 加载，绕过 SELinux path 检查
     // 手动清零 (shellcode 不能调用 memset)
@@ -153,11 +139,23 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
             // 发送线程创建失败消息
             write(ctrl_fd, pthread_err, pthread_err_len);
             close(ctrl_fd);
+            close(memfd);
+            free(offsets);
+            free(dl);
+            free(table);
+            free(agent_args);
+            return -6;
         }
     } else {
         // 发送符号查找失败消息
         write(ctrl_fd, dlsym_err, dlsym_err_len);
         close(ctrl_fd);
+        close(memfd);
+        free(offsets);
+        free(dl);
+        free(table);
+        free(agent_args);
+        return -7;
     }
 
     close(memfd);
@@ -168,31 +166,3 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
     return 1;
 }
 
-static int recv_fd(int sock, ssize_t (*recvmsg_fn)(int, struct msghdr*, int)) {
-    struct msghdr msg = {0};
-    struct cmsghdr *cmsg;
-    char buf[CMSG_SPACE(sizeof(int))];
-    char databuf[8]; // 匹配 sendmsg 发送的 "AGENT_SO" (8 bytes)
-    struct iovec io = {
-        .iov_base = databuf,
-        .iov_len = sizeof(databuf)
-    };
-
-    msg.msg_iov = &io;
-    msg.msg_iovlen = 1;
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
-
-    if (recvmsg_fn(sock, &msg, 0) < 0) {
-        return -1;
-    }
-
-    cmsg = CMSG_FIRSTHDR(&msg);
-    if (!cmsg) return -1;
-
-    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
-        return -1;
-    }
-
-    return *((int*) CMSG_DATA(cmsg));
-}

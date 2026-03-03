@@ -7,6 +7,7 @@ mod logger;
 mod proc_mem;
 mod process;
 mod repl;
+mod selinux;
 mod spawn;
 mod types;
 
@@ -141,7 +142,7 @@ fn main() {
                 log_warn!("  4. adb logcat | grep rustFrida  （查看 agent 日志）");
                 std::process::exit(1);
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
     let sender = GLOBAL_SENDER.get().unwrap();

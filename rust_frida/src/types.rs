@@ -1,8 +1,8 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
 use libc::{
-    c_void, close, dlerror, dlopen, dlsym, free, malloc, mmap, munmap,
-    pthread_create, pthread_detach, recvmsg, socketpair, strlen, write,
+    c_void, close, dlerror, dlopen, dlsym, free, malloc, memfd_create, mmap, munmap,
+    pthread_create, pthread_detach, socketpair, strlen, write,
 };
 use paste::paste;
 use std::os::raw::c_int;
@@ -158,7 +158,7 @@ define_libc_functions!(
     close,      // 用于关闭套接字
     mmap,       // 用于内存映射
     munmap,     // 用于释放内存映射
-    recvmsg,    // 用于接收文件描述符
+    memfd_create, // 用于创建匿名内存文件
     pthread_create,
     pthread_detach,
     strlen
@@ -178,7 +178,7 @@ define_dl_functions!(
 pub(crate) struct AgentArgs {
     pub(crate) table: u64,   // *const StringTable（目标进程内地址）
     pub(crate) ctrl_fd: i32, // socketpair fd1（agent 端）
-    pub(crate) _pad: i32,    // 对齐填充
+    pub(crate) agent_memfd: i32, // 目标进程内的 agent.so memfd
 }
 
 /// 用户空间寄存器结构体

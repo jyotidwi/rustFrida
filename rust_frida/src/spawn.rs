@@ -290,6 +290,11 @@ fn ensure_zymbiote_loaded() -> Result<(), String> {
     let already_initialized = ZYGOTE_PATCHES.get().is_some();
 
     if !already_initialized {
+        // 修补 SELinux 策略，允许子进程连接 abstract socket
+        if let Err(e) = crate::selinux::patch_selinux_for_spawn() {
+            log_warn!("SELinux 策略修补失败: {}（继续尝试注入）", e);
+        }
+
         // 首次初始化：生成 socket 名称，启动 listener
         let socket_name = generate_socket_name();
         log_verbose!("Zymbiote socket 名称: {}", socket_name);
@@ -1628,6 +1633,9 @@ pub(crate) fn cleanup_zygote_patches() {
     }
 
     patches.clear();
+
+    // 还原 SELinux 状态
+    crate::selinux::restore_selinux();
 }
 
 /// 是否已执行过清理（幂等保护，cleanup_zygote_patches 内部使用）
