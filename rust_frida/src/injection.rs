@@ -24,6 +24,9 @@ pub(crate) const AGENT_SO: &[u8] =
 pub(crate) const AGENT_SO: &[u8] =
     include_bytes!("../../target/aarch64-linux-android/release/libagent.so");
 
+/// 最小化空 SO（无符号、无 .init_array），用于隔离 memfd 映射检测
+const EMPTY_SO: &[u8] = include_bytes!("../../loader/build/empty.so");
+
 /// 在目标进程中分配内存并写入结构体，返回远程地址。
 fn alloc_and_write_struct<T>(pid: i32, malloc_addr: usize, data: &T, name: &str) -> Result<usize, String> {
     let size = size_of::<T>();
@@ -101,7 +104,7 @@ fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
 
 /// 在目标进程中调用 memfd_create()，返回目标进程内的 fd 号
 fn create_memfd_in_target(pid: i32, offsets: &LibcOffsets) -> Result<i32, String> {
-    let name = b"jit-cache\0";
+    let name = b"wwb_so\0";
     let name_addr = call_target_function(pid, offsets.malloc, &[name.len()], None)
         .map_err(|e| format!("分配 memfd name 内存失败: {}", e))?;
     write_bytes(pid, name_addr, name)?;
@@ -195,33 +198,7 @@ pub(crate) fn inject_to_process(
     log_verbose!("目标进程 fd0={} 已关闭，fd1={} 保留给 agent", fd0, fd1);
 
     // 4. 在目标进程中创建 memfd，pidfd_getfd 提取到 host，写入 agent.so
-    let target_memfd = create_memfd_in_target(pid, &offsets)?;
-    let host_memfd = extract_fd_from_target(pid, target_memfd)?;
-    log_verbose!("已提取目标 memfd: target_fd={} → host_fd={}", target_memfd, host_memfd);
-
-    // 写入 AGENT_SO 数据到 host_memfd
-    let mut written = 0usize;
-    while written < AGENT_SO.len() {
-        let ret = unsafe {
-            libc_write(
-                host_memfd,
-                AGENT_SO[written..].as_ptr() as *const c_void,
-                AGENT_SO.len() - written,
-            )
-        };
-        if ret >= 0 {
-            written += ret as usize;
-        } else {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            unsafe { close(host_memfd) };
-            return Err(format!("写入 agent.so 到 memfd 失败: {}", err));
-        }
-    }
-    unsafe { close(host_memfd) };
-    log_verbose!("agent.so ({} bytes) 已写入目标进程 memfd", AGENT_SO.len());
+    let target_memfd = create_and_fill_memfd(pid, &offsets, AGENT_SO, "agent.so")?;
 
     // === 分配并写入注入数据 ===
     log_verbose!("开始分配内存");
@@ -327,6 +304,367 @@ pub(crate) fn inject_to_process(
             Err(e)
         }
     }
+}
+
+/// Debug 注入模式
+#[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
+pub(crate) enum DebugInjectMode {
+    /// 仅 ptrace attach + 调用 malloc + detach（测试 ptrace 痕迹检测）
+    PtraceOnly,
+    /// 仅创建 memfd + 写入 SO + 关闭（不 dlopen，测试 memfd fd 暴露）
+    MemfdOnly,
+    /// 仅 dlopen agent.so（测试 memfd 映射检测）
+    SoOnly,
+    /// dlopen 空 SO（测试 memfd 映射本身是否被检测，排除 SO 内容因素）
+    SoEmpty,
+    /// dlopen + socketpair（测试 maps + fd 检测）
+    #[value(name = "so+fd")]
+    SoFd,
+    /// 完整注入（等价于正常注入，但不启动 REPL）
+    #[value(name = "so+fd+thread")]
+    SoFdThread,
+    /// 仅创建 socketpair（测试纯 fd 暴露）
+    FdOnly,
+}
+
+impl DebugInjectMode {
+    pub(crate) fn description(&self) -> &'static str {
+        match self {
+            Self::PtraceOnly => "仅 ptrace attach + malloc + detach",
+            Self::MemfdOnly => "仅 memfd_create + 写入 + 关闭（不 dlopen）",
+            Self::SoOnly => "仅 dlopen agent.so",
+            Self::SoEmpty => "dlopen 空 SO（排除内容检测）",
+            Self::SoFd => "dlopen + socketpair",
+            Self::SoFdThread => "完整注入（不启动 REPL）",
+            Self::FdOnly => "仅创建 socketpair",
+        }
+    }
+
+    pub(crate) fn needs_dlopen(&self) -> bool {
+        matches!(self, Self::SoOnly | Self::SoEmpty | Self::SoFd | Self::SoFdThread)
+    }
+
+    pub(crate) fn needs_socketpair(&self) -> bool {
+        matches!(self, Self::SoFd | Self::SoFdThread | Self::FdOnly)
+    }
+
+    /// 是否使用空 SO 代替 agent.so
+    pub(crate) fn use_empty_so(&self) -> bool {
+        matches!(self, Self::SoEmpty)
+    }
+}
+
+/// hide_soinfo 调试结果，与 hide_soinfo.c 中的 struct hide_result ABI 一致
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HideResult {
+    status: i32,             // 0=未执行, 1=成功, 负数=错误码
+    next_offset: i32,        // 推导出的 soinfo::next 偏移, -1=失败
+    entries_scanned: i32,    // 遍历的 soinfo 条目数
+    sym_matched: i32,        // 匹配的 linker 符号数
+    head_ptr: u64,           // solist head 地址
+    target_ptr: u64,         // 被隐藏的 soinfo 地址
+    error: [u8; 128],        // 错误描述
+    target_path: [u8; 128],  // 被隐藏目标的路径
+    head_path: [u8; 128],    // head 的路径
+}
+
+impl Default for HideResult {
+    fn default() -> Self {
+        // Safety: all-zero is valid for this struct (ints=0, u64s=0, arrays=zeroed)
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+impl HideResult {
+    fn cstr(buf: &[u8]) -> &str {
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        std::str::from_utf8(&buf[..end]).unwrap_or("")
+    }
+}
+
+/// android_dlextinfo 结构体，与 NDK <android/dlext.h> ABI 一致 (aarch64)
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct AndroidDlextinfo {
+    flags: u64,              // ANDROID_DLEXT_USE_LIBRARY_FD = 0x10
+    reserved_addr: u64,      // 0
+    reserved_size: u64,      // 0
+    relro_fd: i32,           // 0
+    library_fd: i32,         // memfd
+    library_fd_offset: u64,  // 0
+    library_namespace: u64,  // 0
+}
+
+/// 在目标进程中创建 memfd 并从 host 写入 SO 数据
+fn create_and_fill_memfd(pid: i32, offsets: &LibcOffsets, so_data: &[u8], label: &str) -> Result<i32, String> {
+    let target_memfd = create_memfd_in_target(pid, offsets)?;
+    let host_memfd = extract_fd_from_target(pid, target_memfd)?;
+    log_verbose!("已提取目标 memfd: target_fd={} → host_fd={}", target_memfd, host_memfd);
+
+    // 写入 SO 数据到 host_memfd
+    let mut written = 0usize;
+    while written < so_data.len() {
+        let ret = unsafe {
+            libc_write(
+                host_memfd,
+                so_data[written..].as_ptr() as *const c_void,
+                so_data.len() - written,
+            )
+        };
+        if ret >= 0 {
+            written += ret as usize;
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            unsafe { close(host_memfd) };
+            return Err(format!("写入 {} 到 memfd 失败: {}", label, err));
+        }
+    }
+    unsafe { close(host_memfd) };
+    log_verbose!("{} ({} bytes) 已写入目标进程 memfd", label, so_data.len());
+    Ok(target_memfd)
+}
+
+/// 通过 ptrace 直接调用 android_dlopen_ext 加载 memfd 中的 agent.so（不走 shellcode/agent 线程）
+/// 返回 dlopen handle（非零表示成功）
+fn dlopen_agent_via_ptrace(
+    pid: i32,
+    target_memfd: i32,
+    offsets: &LibcOffsets,
+    dl_offsets: &DlOffsets,
+) -> Result<usize, String> {
+    // 在目标进程中分配并写入 lib name 字符串
+    let lib_name = b"agent.so\0";
+    let name_addr = call_target_function(pid, offsets.malloc, &[lib_name.len()], None)
+        .map_err(|e| format!("分配 lib_name 内存失败: {}", e))?;
+    write_bytes(pid, name_addr, lib_name)?;
+
+    // 构造 android_dlextinfo
+    let ext_info = AndroidDlextinfo {
+        flags: 0x10, // ANDROID_DLEXT_USE_LIBRARY_FD
+        library_fd: target_memfd,
+        ..Default::default()
+    };
+    let ext_info_addr = alloc_and_write_struct(pid, offsets.malloc, &ext_info, "android_dlextinfo")?;
+
+    // 调用 android_dlopen_ext(name, RTLD_NOW=2, &ext_info)
+    let handle = call_target_function(
+        pid,
+        dl_offsets.android_dlopen_ext,
+        &[name_addr, 2, ext_info_addr],
+        None,
+    )
+    .map_err(|e| format!("调用 android_dlopen_ext 失败: {}", e))?;
+
+    // 释放临时内存
+    let _ = call_target_function(pid, offsets.free, &[name_addr], None);
+    let _ = call_target_function(pid, offsets.free, &[ext_info_addr], None);
+
+    if handle == 0 {
+        // 尝试获取 dlerror
+        if let Ok(err_ptr) = call_target_function(pid, dl_offsets.dlerror, &[], None) {
+            if err_ptr != 0 {
+                // 读取错误字符串（用 strlen 获取长度，最多读 256 字节）
+                if let Ok(len) = call_target_function(pid, offsets.strlen, &[err_ptr], None) {
+                    let read_len = len.min(256);
+                    // 逐 8 字节读取拼接
+                    let mut buf = Vec::with_capacity(read_len);
+                    let mut off = 0;
+                    while off < read_len {
+                        if let Ok(word) = read_memory::<u64>(pid, err_ptr + off) {
+                            let bytes = word.to_le_bytes();
+                            let remaining = read_len - off;
+                            buf.extend_from_slice(&bytes[..remaining.min(8)]);
+                        } else {
+                            break;
+                        }
+                        off += 8;
+                    }
+                    if !buf.is_empty() {
+                        let msg = String::from_utf8_lossy(&buf[..buf.len().min(read_len)]);
+                        return Err(format!("android_dlopen_ext 失败: {}", msg));
+                    }
+                }
+            }
+        }
+        return Err("android_dlopen_ext 返回 NULL（dlopen 失败）".to_string());
+    }
+
+    log_success!("android_dlopen_ext 成功，handle=0x{:x}", handle);
+    Ok(handle)
+}
+
+/// Debug 注入：根据模式选择性注入组件，用于隔离测试检测向量
+/// 返回 Option<RawFd>：有 socketpair 时返回 host_fd，否则 None
+pub(crate) fn inject_debug(
+    pid: i32,
+    mode: DebugInjectMode,
+    string_overrides: &std::collections::HashMap<String, String>,
+) -> Result<Option<RawFd>, String> {
+    // so+fd+thread 模式直接复用完整注入流程
+    if mode == DebugInjectMode::SoFdThread {
+        log_info!("Debug 模式 so+fd+thread: 执行完整注入流程");
+        return inject_to_process(pid, string_overrides).map(Some);
+    }
+
+    log_info!("正在附加到进程 PID: {} (debug 模式: {})", pid, mode.description());
+
+    // 计算 offsets
+    let self_base = get_lib_base(None, "libc.so")?;
+    let target_base = get_lib_base(Some(pid), "libc.so")?;
+
+    let offsets = LibcOffsets::calculate(self_base, target_base)?;
+
+    // ptrace-only 不需要 libdl
+    let dl_offsets = if mode.needs_dlopen() {
+        let self_dl_base = get_lib_base(None, "libdl.so")?;
+        let target_dl_base = get_lib_base(Some(pid), "libdl.so")?;
+        Some(DlOffsets::calculate(self_dl_base, target_dl_base)?)
+    } else {
+        None
+    };
+
+    if crate::logger::is_verbose() {
+        offsets.print_offsets();
+        if let Some(ref dl) = dl_offsets {
+            dl.print_offsets();
+        }
+    }
+
+    // 附加到目标进程
+    attach_to_process(pid)?;
+
+    // ptrace-only: 只调用 malloc + free，不注入任何东西
+    if mode == DebugInjectMode::PtraceOnly {
+        let ptr = call_target_function(pid, offsets.malloc, &[64], None)
+            .map_err(|e| format!("调用 malloc 失败: {}", e))?;
+        log_success!("malloc(64) = 0x{:x}", ptr);
+        let _ = call_target_function(pid, offsets.free, &[ptr], None);
+        log_success!("free(0x{:x}) 完成", ptr);
+
+        if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {
+            log_error!("分离目标进程失败: {}", e);
+        } else {
+            log_success!("已分离目标进程");
+        }
+        return Ok(None);
+    }
+
+    // memfd-only: 创建 memfd + 写入 SO 数据 + 关闭 fd，不 dlopen
+    // 隔离 memfd fd 暴露 vs dl_iterate_phdr 检测
+    if mode == DebugInjectMode::MemfdOnly {
+        let target_memfd = create_and_fill_memfd(pid, &offsets, EMPTY_SO, "empty.so")?;
+        log_success!("memfd 创建并写入完成: target_fd={}", target_memfd);
+        // 立即关闭 memfd（不 dlopen），测试纯 memfd 创建+关闭是否被检测
+        let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);
+        log_success!("memfd 已关闭");
+
+        if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {
+            log_error!("分离目标进程失败: {}", e);
+        } else {
+            log_success!("已分离目标进程");
+        }
+        return Ok(None);
+    }
+
+    let mut host_fd: Option<RawFd> = None;
+
+    // socketpair（fd-only / so+fd）
+    if mode.needs_socketpair() {
+        let (fd0, fd1) = create_socketpair_in_target(pid, &offsets)?;
+        let extracted = extract_fd_from_target(pid, fd0)?;
+        // 关闭目标进程的 fd0
+        let _ = call_target_function(pid, offsets.close, &[fd0 as usize], None);
+        log_success!("socketpair 创建成功: host_fd={}, target_fd1={}", extracted, fd1);
+        host_fd = Some(extracted);
+
+        // fd-only 模式到此为止：也关闭目标进程的 fd1（只测试 fd 是否被探测）
+        if mode == DebugInjectMode::FdOnly {
+            // 保留 fd1 不关闭——检测工具会扫描 /proc/pid/fd
+            log_info!("fd-only 模式: socketpair fd1={} 保留在目标进程中", fd1);
+        }
+    }
+
+    // dlopen SO（so-only / so-empty / so+fd）
+    if mode.needs_dlopen() {
+        let dl = dl_offsets.as_ref().unwrap();
+        let (so_data, label): (&[u8], &str) = if mode.use_empty_so() {
+            (EMPTY_SO, "empty.so")
+        } else {
+            (AGENT_SO, "agent.so")
+        };
+        let target_memfd = create_and_fill_memfd(pid, &offsets, so_data, label)?;
+        let handle = dlopen_agent_via_ptrace(pid, target_memfd, &offsets, dl)?;
+        // 关闭 memfd（SO 已加载，memfd 不再需要）
+        let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);
+        log_success!("{} dlopen 完成", label);
+
+        // 读取 hide_soinfo 结果（仅非空 SO）
+        if !mode.use_empty_so() && handle != 0 {
+            let sym_name = b"rust_get_hide_result\0";
+            let sym_addr = call_target_function(pid, offsets.malloc, &[sym_name.len()], None)
+                .ok();
+            if let Some(sym_addr) = sym_addr {
+                let _ = write_bytes(pid, sym_addr, sym_name);
+                if let Ok(fn_ptr) = call_target_function(pid, dl.dlsym, &[handle, sym_addr], None) {
+                    let _ = call_target_function(pid, offsets.free, &[sym_addr], None);
+                    if fn_ptr != 0 {
+                        // 调用 rust_get_hide_result() → 返回 struct hide_result*
+                        if let Ok(result_ptr) = call_target_function(pid, fn_ptr, &[], None) {
+                            if result_ptr != 0 {
+                                if let Ok(r) = read_memory::<HideResult>(pid, result_ptr) {
+                                    let tp_str = HideResult::cstr(&r.target_path);
+                                    let hp_str = HideResult::cstr(&r.head_path);
+                                    if r.status == 1 {
+                                        log_success!("hide_soinfo: 成功隐藏 \"{}\"", tp_str);
+                                        log_info!("  next_offset=0x{:x}, scanned={}, syms={}", r.next_offset, r.entries_scanned, r.sym_matched);
+                                        log_info!("  head=\"{}\", target=0x{:x}", hp_str, r.target_ptr);
+                                    } else {
+                                        log_error!("hide_soinfo: 失败 (status={})", r.status);
+                                        let err_str = HideResult::cstr(&r.error);
+                                        if !err_str.is_empty() {
+                                            log_error!("  error: {}", err_str);
+                                        }
+                                        log_info!("  next_offset=0x{:x}, scanned={}, syms={}", r.next_offset, r.entries_scanned, r.sym_matched);
+                                        log_info!("  head=0x{:x}, head_path=\"{}\"", r.head_ptr, hp_str);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        log_warn!("dlsym(rust_get_hide_result) 返回 NULL");
+                    }
+                } else {
+                    let _ = call_target_function(pid, offsets.free, &[sym_addr], None);
+                }
+            }
+        }
+    }
+
+    // detach 前检查 maps 中 memfd/wwb 条目（调试用）
+    if let Ok(maps) = std::fs::read_to_string(format!("/proc/{}/maps", pid)) {
+        let memfd_lines: Vec<&str> = maps.lines().filter(|l| l.contains("memfd") || l.contains("wwb")).collect();
+        if memfd_lines.is_empty() {
+            log_info!("maps 中无 memfd/wwb 条目（KPM 隐藏生效）");
+        } else {
+            log_warn!("maps 中仍有 memfd 条目:");
+            for l in &memfd_lines {
+                log_warn!("  {}", l);
+            }
+        }
+    }
+
+    // detach
+    if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {
+        log_error!("分离目标进程失败: {}", e);
+    } else {
+        log_success!("已分离目标进程");
+    }
+
+    Ok(host_fd)
 }
 
 /// 根据 UID 查找 /data/data/ 目录下对应的应用数据目录

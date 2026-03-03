@@ -43,6 +43,17 @@ use std::time::Duration;
 
 pub(crate) use exec_mem::ExecMem;
 
+// hide_soinfo.c 中的调试结果函数（.init_array 构造函数填充）
+// 通过 Rust #[no_mangle] 重导出到动态符号表，供 host 端 dlsym 查询
+extern "C" {
+    fn get_hide_result() -> *const c_void;
+}
+
+#[no_mangle]
+pub extern "C" fn rust_get_hide_result() -> *const c_void {
+    unsafe { get_hide_result() }
+}
+
 // 定义我们自己的Result类型，错误统一为String
 type Result<T> = std::result::Result<T, String>;
 

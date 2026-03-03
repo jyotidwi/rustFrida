@@ -1,6 +1,7 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
 use clap::{ArgGroup, Parser};
+use crate::injection::DebugInjectMode;
 
 fn parse_pid(s: &str) -> std::result::Result<i32, String> {
     match s.parse::<i32>() {
@@ -79,4 +80,10 @@ pub(crate) struct Args {
     /// 显示详细注入信息（地址、偏移等）
     #[arg(short = 'v', long = "verbose")]
     pub(crate) verbose: bool,
+
+    /// Debug 注入模式：隔离测试各注入组件的检测向量
+    ///
+    /// 注入后监控进程存活状态 15 秒，不启动 REPL
+    #[arg(long = "debug-inject", value_name = "MODE", value_enum)]
+    pub(crate) debug_inject: Option<DebugInjectMode>,
 }

@@ -94,7 +94,7 @@ struct UnrestrictedLinkerApi {
     dlopen: unsafe extern "C" fn(*const i8, i32, *const std::ffi::c_void) -> *mut std::ffi::c_void,
     /// __dl___loader_dlvsym(handle, symbol, version, caller_addr) -> addr
     dlsym: unsafe extern "C" fn(*mut std::ffi::c_void, *const i8, *const i8, *const std::ffi::c_void) -> *mut std::ffi::c_void,
-    /// Trusted caller address (libc's open())
+    /// Trusted caller address (linker64 内部地址，dlopen_addr)
     trusted_caller: *const std::ffi::c_void,
     /// dl_mutex — __dl__ZL10g_dl_mutex
     dl_mutex: *mut libc::pthread_mutex_t,
@@ -724,13 +724,11 @@ unsafe fn init_unrestricted_linker_api() -> Option<UnrestrictedLinkerApi> {
     let dlopen_addr = dlopen_addr.unwrap();
     let dlsym_addr = dlsym_addr.unwrap();
 
-    // Get trusted_caller from libc (open() is always accessible)
-    let open_sym = CString::new("open").unwrap();
-    let trusted_caller = libc::dlsym(libc::RTLD_DEFAULT, open_sym.as_ptr());
-    if trusted_caller.is_null() {
-        output_message("[linker api] dlsym(RTLD_DEFAULT, \"open\") failed");
-        return None;
-    }
+    // 使用已解析的 linker 符号地址作为 trusted_caller（避免 dlsym 依赖）
+    // hide_soinfo.c 的 .init_array 会在 dlopen 时摘除 agent 的 soinfo，
+    // 导致后续 dlsym(RTLD_DEFAULT, ...) 因找不到 caller 的 soinfo 而失败。
+    // 直接用 linker64 内部地址作为 trusted_caller 绕过此问题。
+    let trusted_caller = dlopen_addr as *mut std::ffi::c_void;
 
     output_message(&format!(
         "[linker api] unrestricted API: dlopen={:#x}, dlsym={:#x}, trusted_caller={:#x}",
@@ -831,18 +829,12 @@ unsafe fn get_libart_handle() -> *mut std::ffi::c_void {
 
 /// Get a dlopen handle to an arbitrary module via unrestricted linker API.
 ///
-/// 1. Try standard dlopen(name, RTLD_NOLOAD) first
-/// 2. Find module base from /proc/self/maps → use as caller_addr → unrestricted dlopen
+/// hide_soinfo 摘除 agent soinfo 后，libc::dlopen 会导致 linker 内部空指针崩溃，
+/// 因此跳过 standard dlopen fast path，直接走 unrestricted API。
 unsafe fn module_dlopen(module_name: &str) -> *mut std::ffi::c_void {
     let c_name = CString::new(module_name).unwrap();
 
-    // Fast path: standard dlopen
-    let handle = libc::dlopen(c_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
-    if !handle.is_null() {
-        return handle;
-    }
-
-    // Unrestricted path: find module base → use as caller → namespace bypass
+    // 直接走 unrestricted path（跳过 standard dlopen fast path）
     let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
     if let Some(api) = api {
         let base = find_module_base(module_name);
@@ -874,18 +866,12 @@ unsafe fn module_dlopen(module_name: &str) -> *mut std::ffi::c_void {
 
 /// Resolve a symbol from an arbitrary module, bypassing linker namespace restrictions.
 ///
-/// 1. dlsym(RTLD_DEFAULT) — fast path
-/// 2. module_dlopen(module) → unrestricted dlvsym
-unsafe fn module_dlsym(module_name: &str, symbol: &str) -> *mut std::ffi::c_void {
+/// hide_soinfo 摘除 agent soinfo 后，libc::dlsym(RTLD_DEFAULT) 可能导致 linker
+/// 内部空指针崩溃（caller soinfo 不存在），因此跳过 fast path，直接走 unrestricted API。
+pub(crate) unsafe fn module_dlsym(module_name: &str, symbol: &str) -> *mut std::ffi::c_void {
     let c_sym = CString::new(symbol).unwrap();
 
-    // Fast path
-    let addr = libc::dlsym(libc::RTLD_DEFAULT, c_sym.as_ptr());
-    if !addr.is_null() {
-        return addr;
-    }
-
-    // Unrestricted path
+    // Unrestricted path (skip RTLD_DEFAULT fast path — crashes after soinfo removal)
     let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
     if let Some(api) = api {
         let handle = module_dlopen(module_name);
@@ -902,19 +888,12 @@ unsafe fn module_dlsym(module_name: &str, symbol: &str) -> *mut std::ffi::c_void
 
 /// Resolve a symbol from libart.so, bypassing linker namespace restrictions.
 ///
-/// Strategy (Frida-style):
-/// 1. dlsym(RTLD_DEFAULT) — fast path
-/// 2. Unrestricted dlvsym via linker internal API
+/// hide_soinfo 摘除 agent soinfo 后，libc::dlsym(RTLD_DEFAULT) 会导致 linker
+/// 内部空指针崩溃，因此跳过 fast path，直接走 unrestricted dlvsym。
 pub(crate) unsafe fn libart_dlsym(name: &str) -> *mut std::ffi::c_void {
     let c_sym = CString::new(name).unwrap();
 
-    // Fast path
-    let addr = libc::dlsym(libc::RTLD_DEFAULT, c_sym.as_ptr());
-    if !addr.is_null() {
-        return addr;
-    }
-
-    // Frida-style: unrestricted dlvsym
+    // 直接走 unrestricted dlvsym（跳过 RTLD_DEFAULT fast path）
     let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
     if let Some(api) = api {
         let handle = get_libart_handle();
@@ -1110,9 +1089,14 @@ unsafe extern "C" fn js_module_find_export(
     };
 
     let addr: *mut std::ffi::c_void = if arg0.is_null() || arg0.is_undefined() {
-        // null module → search all loaded modules
+        // null module → search all loaded modules (跳过 RTLD_DEFAULT，soinfo 摘除后会崩溃)
         let c_sym = CString::new(symbol_name.as_str()).unwrap();
-        libc::dlsym(libc::RTLD_DEFAULT, c_sym.as_ptr())
+        let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
+        if let Some(api) = api {
+            (api.dlsym)(libc::RTLD_DEFAULT as _, c_sym.as_ptr() as *const i8, std::ptr::null(), api.trusted_caller)
+        } else {
+            std::ptr::null_mut()
+        }
     } else {
         // Specific module
         let module_name = match arg0.to_string(ctx) {

@@ -222,11 +222,11 @@ static ANDROID_CODENAME: std::sync::OnceLock<String> = std::sync::OnceLock::new(
 /// 读取 Android 系统属性值
 unsafe fn read_system_property(name: &str, buf: &mut [u8]) {
     let prop = CString::new(name).unwrap();
+    // __system_property_get 在 libc.so 中，通过 module_dlsym 精确查找
+    let sym = crate::jsapi::module::module_dlsym("libc.so", "__system_property_get");
+    if sym.is_null() { return; }
     let get_prop: unsafe extern "C" fn(*const c_char, *mut c_char) -> i32 =
-        std::mem::transmute(libc::dlsym(
-            libc::RTLD_DEFAULT,
-            b"__system_property_get\0".as_ptr() as *const _,
-        ));
+        std::mem::transmute(sym);
     get_prop(prop.as_ptr(), buf.as_mut_ptr() as *mut c_char);
 }
 
@@ -614,20 +614,10 @@ pub(super) fn ensure_jni_initialized() -> Result<JniEnv, String> {
 
     // Slow path: find JavaVM first
     unsafe {
-        // Find JNI_GetCreatedJavaVMs — try RTLD_DEFAULT first, then explicit dlopen
-        let sym_name = CString::new("JNI_GetCreatedJavaVMs").unwrap();
-        let mut sym = libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr());
-        if sym.is_null() {
-            // PROTECTED visibility on Android — need explicit dlopen
-            for lib in &["libart.so", "libnativehelper.so"] {
-                let lib_name = CString::new(*lib).unwrap();
-                let handle = libc::dlopen(lib_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
-                if !handle.is_null() {
-                    sym = libc::dlsym(handle, sym_name.as_ptr());
-                    if !sym.is_null() { break; }
-                }
-            }
-        }
+        // Find JNI_GetCreatedJavaVMs — 直接走 unrestricted API
+        // hide_soinfo 摘除 agent soinfo 后，libc::dlsym/dlopen 会导致 linker
+        // 内部空指针崩溃（caller soinfo 不存在），必须跳过。
+        let sym = crate::jsapi::module::libart_dlsym("JNI_GetCreatedJavaVMs");
         if sym.is_null() {
             return Err("dlsym(JNI_GetCreatedJavaVMs) failed".to_string());
         }

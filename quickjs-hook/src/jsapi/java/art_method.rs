@@ -271,16 +271,11 @@ pub(super) unsafe fn find_art_bridge_functions(env: JniEnv, _ep_offset: usize) -
 unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64, u64) {
     // --- Strategy 1: dlsym (可能在某些 Android 构建中可用) ---
     // 注意: art_quick_* 符号通常是 LOCAL HIDDEN，dlsym 一般找不到
-    let sym_jni = CString::new("art_quick_generic_jni_trampoline").unwrap();
-    let sym_interp = CString::new("art_quick_to_interpreter_bridge").unwrap();
-    let sym_resolution = CString::new("art_quick_resolution_trampoline").unwrap();
-
-    let sym_imt = CString::new("art_quick_imt_conflict_trampoline").unwrap();
-
-    let jni_sym = libc::dlsym(libc::RTLD_DEFAULT, sym_jni.as_ptr());
-    let interp_sym = libc::dlsym(libc::RTLD_DEFAULT, sym_interp.as_ptr());
-    let resolution_sym = libc::dlsym(libc::RTLD_DEFAULT, sym_resolution.as_ptr());
-    let imt_sym = libc::dlsym(libc::RTLD_DEFAULT, sym_imt.as_ptr());
+    // 通过 unrestricted API 查找（soinfo 摘除后 libc::dlsym 会崩溃）
+    let jni_sym = crate::jsapi::module::libart_dlsym("art_quick_generic_jni_trampoline");
+    let interp_sym = crate::jsapi::module::libart_dlsym("art_quick_to_interpreter_bridge");
+    let resolution_sym = crate::jsapi::module::libart_dlsym("art_quick_resolution_trampoline");
+    let imt_sym = crate::jsapi::module::libart_dlsym("art_quick_imt_conflict_trampoline");
 
     if !jni_sym.is_null() && !interp_sym.is_null() && !resolution_sym.is_null() {
         output_message("[art bridge] 全部通过 dlsym 发现");
@@ -537,8 +532,7 @@ pub(super) unsafe fn try_invalidate_jit_cache() {
 
     // 从 Runtime 获取 jit_code_cache_:
     // 尝试 dlsym Runtime::instance_ 获取更可靠的路径
-    let instance_sym = CString::new("_ZN3art7Runtime9instance_E").unwrap();
-    let instance_ptr = libc::dlsym(libc::RTLD_DEFAULT, instance_sym.as_ptr());
+    let instance_ptr = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime9instance_E");
 
     let runtime_addr = if !instance_ptr.is_null() {
         let rt = *(instance_ptr as *const u64);
@@ -562,10 +556,9 @@ pub(super) unsafe fn try_invalidate_jit_cache() {
     // 实际上最简单的方案: 扫描 Runtime 寻找指向合法 JitCodeCache 的指针
 
     // 使用 Jit::GetCodeCache() 如果可用
-    let get_code_cache_sym = CString::new(
+    let get_code_cache_ptr = crate::jsapi::module::libart_dlsym(
         "_ZNK3art3jit3Jit12GetCodeCacheEv"
-    ).unwrap();
-    let get_code_cache_ptr = libc::dlsym(libc::RTLD_DEFAULT, get_code_cache_sym.as_ptr());
+    );
 
     if !get_code_cache_ptr.is_null() {
         // 需要 Jit* this — 从 Runtime 获取
@@ -1108,8 +1101,7 @@ fn get_deoptimization_enabled_offset() -> Option<usize> {
 /// 仅支持 ARM64。
 pub(super) fn probe_instrumentation_spec() -> Option<InstrumentationSpec> {
     // Step 1: dlsym 查找 art::Runtime::DeoptimizeBootImage
-    let sym_name = CString::new("_ZN3art7Runtime19DeoptimizeBootImageEv").unwrap();
-    let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr()) };
+    let sym = unsafe { crate::jsapi::module::libart_dlsym("_ZN3art7Runtime19DeoptimizeBootImageEv") };
     if sym.is_null() {
         output_message("[instrumentation] DeoptimizeBootImage 符号未找到");
         return None;
