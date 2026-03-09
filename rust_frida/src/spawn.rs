@@ -99,6 +99,47 @@ impl SpawnNotifier {
     }
 }
 
+fn unregister_spawn_request(process_name: &str, package: &str, dual_key: bool) {
+    if let Some(requests) = SPAWN_REQUESTS.get() {
+        if let Ok(mut map) = requests.lock() {
+            map.remove(process_name);
+            if dual_key {
+                map.remove(package);
+            }
+        }
+    }
+}
+
+fn cleanup_orphan_spawn_connections() {
+    // 延迟短暂等待后检查，给 listener 线程一点时间完成存储
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let Some(conns) = ACTIVE_CONNECTIONS.get() else {
+        return;
+    };
+
+    let orphan_entries: Vec<(u32, (std::os::unix::net::UnixStream, u32))> = {
+        let mut map = conns.lock().unwrap();
+        map.drain().collect()
+    };
+
+    for (orphan_pid, (mut stream, ppid)) in orphan_entries {
+        log_warn!("清理超时孤儿连接: pid={}", orphan_pid);
+        // 发 ACK 恢复子进程，避免永远挂起
+        let _ = stream.write_all(&[ACK_BYTE]);
+        // 等 EOF → 等 SIGSTOP → 还原 → SIGCONT（同步执行，
+        // 防止 fire-and-forget 线程未完成就 exit 导致子进程卡在 SIGSTOP）
+        drain_until_eof(&mut stream, std::time::Duration::from_secs(5));
+        drop(stream);
+        if let Err(e) = wait_until_stopped(orphan_pid) {
+            log_verbose!("等待孤儿子进程 {} SIGSTOP 失败: {}", orphan_pid, e);
+        } else {
+            let _ = revert_child_patch_by_ppid(orphan_pid, ppid);
+        }
+        unsafe { libc::kill(orphan_pid as i32, libc::SIGCONT) };
+    }
+}
+
 // ZymbioteContext 字段偏移常量（与 zymbiote.c 布局完全一致）
 const CTX_SOCKET_PATH: usize = 0;
 const CTX_PAYLOAD_BASE: usize = 64;
@@ -194,63 +235,42 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
 
     // 4. 等待 SpawnHello（20s 超时）
     log_info!("等待应用 {} 启动... (最长 20s)", package);
-    let hello = match notifier.recv_timeout(std::time::Duration::from_secs(20)) {
-        Some(hello) => hello,
-        None => {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let poll_interval = std::time::Duration::from_millis(100);
+    let hello = loop {
+        if let Some(hello) = notifier.try_recv() {
+            break hello;
+        }
+
+        if signal_received() {
+            unregister_spawn_request(&process_name, package, dual_key);
+            return Err(format!("等待应用 {} 启动时收到终止信号", package));
+        }
+
+        let now = std::time::Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
             // 超时后再 try_recv 一次：防止在极短窗口内 hello 刚到达但 condvar 已超时
             if let Some(late_hello) = notifier.try_recv() {
                 log_verbose!("超时后发现晚到的 hello (pid={})", late_hello.pid);
-                late_hello
-            } else {
-                // 真正超时：清理请求
-                if let Some(requests) = SPAWN_REQUESTS.get() {
-                    let mut map = requests.lock().unwrap();
-                    map.remove(&process_name);
-                    if dual_key {
-                        map.remove(package);
-                    }
-                }
-                // 清理 ACTIVE_CONNECTIONS 中可能残留的连接（listener 线程可能已存储 stream）
-                // 延迟短暂等待后检查，给 listener 线程一点时间完成存储
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if let Some(conns) = ACTIVE_CONNECTIONS.get() {
-                    let mut map = conns.lock().unwrap();
-                    // 遍历找出所有还在等待的连接并恢复
-                    let orphan_pids: Vec<u32> = map.keys().copied().collect();
-                    for orphan_pid in orphan_pids {
-                        if let Some((mut stream, ppid)) = map.remove(&orphan_pid) {
-                            log_warn!("清理超时孤儿连接: pid={}", orphan_pid);
-                            // 发 ACK 恢复子进程，避免永远挂起
-                            let _ = stream.write_all(&[ACK_BYTE]);
-                            // 等 EOF → 等 SIGSTOP → 还原 → SIGCONT（同步执行，
-                            // 防止 fire-and-forget 线程未完成就 exit 导致子进程卡在 SIGSTOP）
-                            drain_until_eof(&mut stream, std::time::Duration::from_secs(5));
-                            drop(stream);
-                            if let Err(e) = wait_until_stopped(orphan_pid) {
-                                log_verbose!("等待孤儿子进程 {} SIGSTOP 失败: {}", orphan_pid, e);
-                            } else {
-                                let _ = revert_child_patch_by_ppid(orphan_pid, ppid);
-                            }
-                            unsafe { libc::kill(orphan_pid as i32, libc::SIGCONT) };
-                        }
-                    }
-                }
-                return Err(format!(
-                    "等待应用 {} 启动超时 (20s)，请检查:\n  1. 包名是否正确\n  2. 应用是否已安装\n  3. Zygote 是否已被正确 patch",
-                    package
-                ));
+                break late_hello;
             }
+
+            unregister_spawn_request(&process_name, package, dual_key);
+            cleanup_orphan_spawn_connections();
+            return Err(format!(
+                "等待应用 {} 启动超时 (20s)，请检查:\n  1. 包名是否正确\n  2. 应用是否已安装\n  3. Zygote 是否已被正确 patch",
+                package
+            ));
+        };
+
+        let wait = remaining.min(poll_interval);
+        if let Some(hello) = notifier.recv_timeout(wait) {
+            break hello;
         }
     };
 
     // 清理剩余的 key（handle_zymbiote_connection 已 remove 一个，清理另一个）
-    if let Some(requests) = SPAWN_REQUESTS.get() {
-        let mut map = requests.lock().unwrap();
-        map.remove(&process_name);
-        if dual_key {
-            map.remove(package);
-        }
-    }
+    unregister_spawn_request(&process_name, package, dual_key);
 
     log_success!(
         "收到 spawn hello: pid={}, ppid={}, package={}",
@@ -1592,6 +1612,8 @@ fn cleanup_pending_connections() {
 /// 退出时还原所有 Zygote patch（幂等：多次调用只执行一次）
 /// 与 Frida close() 顺序一致：先恢复挂起的子进程，再还原 Zygote patch
 pub(crate) fn cleanup_zygote_patches() {
+    CLEANUP_STARTED.store(true, Ordering::SeqCst);
+
     // 幂等保护：所有调用路径（正常退出 + 信号处理）共享此检查
     if CLEANUP_DONE.swap(true, Ordering::SeqCst) {
         return;
@@ -1677,10 +1699,12 @@ pub(crate) fn cleanup_zygote_patches() {
 
 /// 是否已执行过清理（幂等保护，cleanup_zygote_patches 内部使用）
 static CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
+/// 清理是否已经开始（第二次 Ctrl+C 仅在此阶段允许强退）
+static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// 信号是否已收到（信号处理函数只设标记，不做清理，避免死锁）
 static SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
-/// 信号计数器：第一次设标记，第二次 _exit 强制退出
+/// 信号计数器：第一次设标记；清理开始后第二次 _exit 强制退出
 static SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
 
 /// 检查是否收到了终止信号
@@ -1692,13 +1716,12 @@ pub(crate) fn signal_received() -> bool {
 /// 不调用 cleanup_zygote_patches（会获取 Mutex 导致死锁），
 /// 清理由 main 退出路径中的 cleanup_zygote_patches() 完成。
 /// 第一次信号：设标记，保持 handler 不变（不恢复 SIG_DFL）。
-/// 第二次信号：_exit(1) 强制退出（async-signal-safe，不经过 cleanup）。
+/// 清理开始后的第二次信号：_exit(1) 强制退出（async-signal-safe，不经过 cleanup）。
 extern "C" fn signal_cleanup_handler(_sig: libc::c_int) {
     let prev = SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
-    if prev == 0 {
-        SIGNAL_RECEIVED.store(true, Ordering::Relaxed);
-    } else {
-        // 第二次信号：强制退出，避免卡死
+    SIGNAL_RECEIVED.store(true, Ordering::Relaxed);
+    if prev > 0 && CLEANUP_STARTED.load(Ordering::Relaxed) {
+        // 清理过程中再次收到信号：强制退出，避免卡死
         unsafe { libc::_exit(1) };
     }
 }
