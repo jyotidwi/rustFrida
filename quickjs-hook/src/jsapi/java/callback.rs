@@ -1028,12 +1028,31 @@ unsafe fn build_jargs_from_registers(
 /// Must be called from within a java_hook_callback (reads CURRENT_HOOK_* globals).
 unsafe extern "C" fn js_call_original(
     ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
+    this_val: ffi::JSValue,
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    let art_method_addr = CURRENT_HOOK_ART_METHOD.load(Ordering::Relaxed);
-    let ctx_ptr = CURRENT_HOOK_CTX_PTR.load(Ordering::Relaxed) as *mut hook_ffi::HookContext;
+    let this_obj = JSValue(this_val);
+    let art_method_addr = {
+        let prop = this_obj.get_property(ctx, "__hookArtMethod");
+        let value = prop.to_u64(ctx).unwrap_or(0);
+        prop.free(ctx);
+        if value != 0 {
+            value
+        } else {
+            CURRENT_HOOK_ART_METHOD.load(Ordering::Relaxed)
+        }
+    };
+    let ctx_ptr = {
+        let prop = this_obj.get_property(ctx, "__hookCtxPtr");
+        let value = prop.to_u64(ctx).unwrap_or(0) as *mut hook_ffi::HookContext;
+        prop.free(ctx);
+        if !value.is_null() {
+            value
+        } else {
+            CURRENT_HOOK_CTX_PTR.load(Ordering::Relaxed) as *mut hook_ffi::HookContext
+        }
+    };
     if ctx_ptr.is_null() || art_method_addr == 0 {
         return ffi::JS_ThrowInternalError(
             ctx,
@@ -1385,6 +1404,17 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                 JSValue(js_ctx).set_property(ctx, "env", JSValue(val));
             }
 
+            // Bind per-callback state to the JS context object so callOriginal()
+            // remains valid across nested hook callbacks and JS-side wrappers.
+            {
+                let val = ffi::JS_NewBigUint64(ctx, ctx_ptr as usize as u64);
+                JSValue(js_ctx).set_property(ctx, "__hookCtxPtr", JSValue(val));
+            }
+            {
+                let val = ffi::JS_NewBigUint64(ctx, art_method_addr);
+                JSValue(js_ctx).set_property(ctx, "__hookArtMethod", JSValue(val));
+            }
+
             // callOriginal()
             {
                 let cname = CString::new("callOriginal").unwrap();
@@ -1442,11 +1472,13 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     );
 
     // Fallback: if JS callback was skipped (engine busy) or threw an exception,
-    // handle_result was NOT called. x[0] still contains JNIEnv* (the entry value).
-    // For non-void methods, ART's GenericJniMethodEnd would interpret JNIEnv* as a
-    // return value — for L/[ types, DecodeJObject(JNIEnv*) crashes.
-    // Fix: call original method via JNI to get a valid return value.
-    if !result_was_set && return_type != b'V' {
+    // handle_result was NOT called. We must still invoke the original method.
+    //
+    // For non-void methods, this avoids returning the entry JNIEnv* as if it were
+    // a real return value. For void methods this is still required because skipping
+    // the original call silently drops side effects; for constructors that means
+    // the object may be returned without its <init> body having run.
+    if !result_was_set {
         let hook_ctx = &*ctx_ptr;
         let env: JniEnv = hook_ctx.x[0] as JniEnv;
         if !env.is_null() && clone_addr != 0 {

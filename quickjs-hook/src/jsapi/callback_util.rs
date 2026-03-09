@@ -9,32 +9,87 @@ use crate::jsapi::ptr::get_native_pointer_addr;
 use crate::value::JSValue;
 use crate::JSEngine;
 use std::sync::MutexGuard;
+use std::time::{Duration, Instant};
+
+const CALLBACK_LOCK_WAIT_SPIN_LIMIT: usize = 32;
+const CALLBACK_LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(3);
+
+pub(crate) enum JsEngineCallbackGuard {
+    Locked {
+        _guard: MutexGuard<'static, Option<JSEngine>>,
+    },
+    Reentrant,
+}
+
+impl Drop for JsEngineCallbackGuard {
+    fn drop(&mut self) {
+        if matches!(self, JsEngineCallbackGuard::Locked { .. }) {
+            crate::clear_js_engine_owner_current_thread();
+        }
+    }
+}
 
 /// Acquire JS_ENGINE lock for a hook callback (try_lock to avoid deadlock).
 ///
-/// Returns None if the lock is held (callback skipped with log message).
+/// Same-thread reentrant callbacks are allowed without re-locking the mutex,
+/// because the current thread already owns the global engine.
+///
+/// Returns None if another thread holds the engine past the wait timeout.
 /// On success, calls qjs_update_stack_top for cross-thread safety.
 pub(crate) unsafe fn acquire_js_engine_for_callback(
     ctx: *mut ffi::JSContext,
     context_name: &str,
     target_id: u64,
-) -> Option<MutexGuard<'static, Option<JSEngine>>> {
-    match crate::JS_ENGINE.try_lock() {
-        Ok(g) => {
-            ffi::qjs_update_stack_top(ctx);
-            Some(g)
-        }
-        Err(std::sync::TryLockError::WouldBlock) => {
-            output_message(&format!(
-                "[{}] callback skipped (JS engine busy), target={:#x}",
-                context_name, target_id
-            ));
-            None
-        }
-        Err(std::sync::TryLockError::Poisoned(e)) => {
-            let g = e.into_inner();
-            ffi::qjs_update_stack_top(ctx);
-            Some(g)
+) -> Option<JsEngineCallbackGuard> {
+    let current_thread = crate::current_thread_id_u64();
+
+    if crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire) == current_thread {
+        ffi::qjs_update_stack_top(ctx);
+        return Some(JsEngineCallbackGuard::Reentrant);
+    }
+
+    let start = Instant::now();
+    let mut spins = 0usize;
+
+    loop {
+        match crate::JS_ENGINE.try_lock() {
+            Ok(g) => {
+                crate::mark_js_engine_owner_current_thread();
+                ffi::qjs_update_stack_top(ctx);
+                return Some(JsEngineCallbackGuard::Locked { _guard: g });
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire)
+                    == current_thread
+                {
+                    ffi::qjs_update_stack_top(ctx);
+                    return Some(JsEngineCallbackGuard::Reentrant);
+                }
+
+                if start.elapsed() >= CALLBACK_LOCK_WAIT_TIMEOUT {
+                    output_message(&format!(
+                        "[{}] callback skipped (JS engine busy > {} ms), target={:#x}",
+                        context_name,
+                        CALLBACK_LOCK_WAIT_TIMEOUT.as_millis(),
+                        target_id
+                    ));
+                    return None;
+                }
+
+                if spins < CALLBACK_LOCK_WAIT_SPIN_LIMIT {
+                    spins += 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                crate::mark_js_engine_owner_current_thread();
+                ffi::qjs_update_stack_top(ctx);
+                return Some(JsEngineCallbackGuard::Locked {
+                    _guard: e.into_inner(),
+                });
+            }
         }
     }
 }

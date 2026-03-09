@@ -352,7 +352,7 @@
                     // Wrap callOriginal so returned objects auto-convert to JS Proxy
                     var origCallOriginal = ctx.callOriginal;
                     ctx.callOriginal = function() {
-                        var ret = origCallOriginal.apply(null, arguments);
+                        var ret = origCallOriginal.apply(ctx, arguments);
                         if (ret !== null && typeof ret === "object"
                             && ret.__jptr !== undefined) {
                             return _wrapJavaObj(ret.__jptr, ret.__jclass);

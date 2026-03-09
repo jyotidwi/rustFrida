@@ -40,11 +40,31 @@ pub use jsapi::java::cleanup_java_hooks;
 pub use runtime::JSRuntime;
 pub use value::JSValue;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Global JS engine instance (protected by Mutex).
 /// pub(crate) so hook_callback_wrapper can serialize concurrent JS_Call invocations.
 pub(crate) static JS_ENGINE: Mutex<Option<JSEngine>> = Mutex::new(None);
+/// Best-effort owner tracking for the thread currently executing inside the global JS engine.
+/// Used by hook callbacks to distinguish same-thread reentrancy from ordinary contention.
+pub(crate) static JS_ENGINE_OWNER_THREAD: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn current_thread_id_u64() -> u64 {
+    unsafe { libc::pthread_self() as usize as u64 }
+}
+
+#[inline]
+pub(crate) fn mark_js_engine_owner_current_thread() {
+    JS_ENGINE_OWNER_THREAD.store(current_thread_id_u64(), Ordering::Release);
+}
+
+#[inline]
+pub(crate) fn clear_js_engine_owner_current_thread() {
+    let current = current_thread_id_u64();
+    let _ = JS_ENGINE_OWNER_THREAD.compare_exchange(current, 0, Ordering::AcqRel, Ordering::Relaxed);
+}
 
 /// Log callback registered with the C hook engine.
 /// Routes hook_engine diagnostic messages through the JS console callback
