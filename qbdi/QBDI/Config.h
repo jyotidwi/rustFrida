@@ -38,6 +38,8 @@
 
 /* #undef QBDI_EXPORT_SYM */
 
+/* #undef QBDI_PTRAUTH */
+
 #ifdef __cplusplus
 namespace QBDI {
 

@@ -71,8 +71,8 @@ pub use vm::{VMOptions, VMRef, VM};
 // Version information
 pub const QBDI_VERSION_MAJOR: u32 = 0;
 pub const QBDI_VERSION_MINOR: u32 = 12;
-pub const QBDI_VERSION_PATCH: u32 = 0;
-pub const QBDI_VERSION_STRING: &str = "0.12.0";
+pub const QBDI_VERSION_PATCH: u32 = 1;
+pub const QBDI_VERSION_STRING: &str = "0.12.1";
 
 /// Get QBDI version information
 pub fn get_version() -> (u32, &'static str) {

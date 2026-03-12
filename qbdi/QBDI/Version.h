@@ -28,12 +28,12 @@ extern "C" {
 
 #define QBDI_VERSION ((0 << 16 ) | \
                       (12 << 8 ) | \
-                      (0 << 0 ))
-#define QBDI_VERSION_STRING "0.12.0"
+                      (1 << 0 ))
+#define QBDI_VERSION_STRING "0.12.1"
 
 #define QBDI_VERSION_MAJOR 0
 #define QBDI_VERSION_MINOR 12
-#define QBDI_VERSION_PATCH 0
+#define QBDI_VERSION_PATCH 1
 #define QBDI_VERSION_DEV 0
 
 #define QBDI_ARCHITECTURE_STRING "AARCH64"
