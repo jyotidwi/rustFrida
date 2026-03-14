@@ -261,6 +261,43 @@ fn instrument_module(vm: VMInstanceRef, module_path: &str) {
     ));
 }
 
+/// 探测不在 /proc/self/maps 中的隐藏内存页
+/// Android 内核可能隐藏 RWX 匿名映射
+fn probe_hidden_page(addr: u64) -> Option<ExecMap> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+    if page_size == 0 {
+        return None;
+    }
+    let page_start = addr & !(page_size - 1);
+
+    let mem_file = std::fs::File::open("/proc/self/mem").ok()?;
+    let mut probe = [0u8; 4];
+    mem_file.read_at(&mut probe, page_start).ok()?;
+
+    // 向后探测连续可读且不在已知 maps 中的页 (最多 1MB)
+    let all_maps = read_exec_maps().ok();
+    let max_pages = 256u64;
+    let mut end = page_start + page_size;
+    for _ in 1..max_pages {
+        if let Some(ref maps) = all_maps {
+            if maps.iter().any(|e| end >= e.start && end < e.end) {
+                break;
+            }
+        }
+        if mem_file.read_at(&mut probe, end).is_err() {
+            break;
+        }
+        end += page_size;
+    }
+
+    Some(ExecMap {
+        start: page_start,
+        end,
+        perms: "rwxp".to_string(),
+        path: String::new(),
+    })
+}
+
 extern "C" fn exec_transfer_call_cb(
     vm: VMInstanceRef,
     _event: *const qbdi::ffi::VMState,
@@ -284,12 +321,22 @@ extern "C" fn exec_transfer_call_cb(
             if is_app_so(&map.path) {
                 let mut added = ADDED_MODULES.lock().unwrap_or_else(|e| e.into_inner());
                 if added.insert(map.path.clone()) {
-                    drop(added); // 释放锁再做后续操作
+                    drop(added);
                     instrument_module(vm, &map.path);
                     return VMAction_QBDI_BREAK_TO_VM;
                 }
             }
+            return VMAction_QBDI_CONTINUE;
         }
+
+        // maps 中找不到 → 可能是隐藏的匿名可执行页
+        // 探测内存可读性，如果可读则加入 instrumented range 并 dump
+        if let Some(map) = probe_hidden_page(dest) {
+            ensure_dynamic_exec_range_instrumented(vm, &map);
+            dump_dynamic_exec_map(&map);
+            return VMAction_QBDI_BREAK_TO_VM;
+        }
+        // 探测失败 (如 ---p guard page) → 不 instrument，让 QBDI 以 native 方式执行
     }
     VMAction_QBDI_CONTINUE
 }
