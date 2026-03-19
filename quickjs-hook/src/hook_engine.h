@@ -311,11 +311,19 @@ void hook_art_router_reset_debug(void);
  * @param jni_env           JNIEnv* for resolving tiny ART trampolines
  * @param out_hooked_target If non-NULL, receives the actual hooked address (may differ
  *                          from target if resolve_art_trampoline resolved a tiny trampoline)
+ * @param skip_resolve      1 to skip resolve_art_trampoline (caller already resolved)
  * @return                  Trampoline address (relocated original instructions), NULL on failure
  */
 void* hook_install_art_router(void* target, uint32_t quickcode_offset,
                                int stealth, void* jni_env,
-                               void** out_hooked_target);
+                               void** out_hooked_target,
+                               int skip_resolve);
+
+/*
+ * Resolve tiny ART trampolines (LDR Xt,[X19,#imm]; BR Xt) to actual target.
+ * Returns the resolved address, or target unchanged if not a trampoline.
+ */
+void* resolve_art_trampoline(void* target, void* jni_env);
 
 /*
  * Create a standalone ART method router stub (no inline patching).

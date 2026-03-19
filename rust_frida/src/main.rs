@@ -20,7 +20,7 @@ use communication::{
     eval_state, send_command, start_socketpair_handler, HostToAgentMessage, AGENT_DISCONNECTED, AGENT_STAT,
     GLOBAL_SENDER,
 };
-use injection::{inject_debug, inject_to_process, watch_and_inject};
+use injection::{inject_via_bootstrapper, watch_and_inject};
 use process::find_pid_by_name;
 use repl::{print_eval_result, print_help, run_js_repl, CommandCompleter};
 use rustyline::error::ReadlineError;
@@ -77,50 +77,6 @@ fn main() {
         }
     }
 
-    // 解析 --debug-inject 模式（clap ValueEnum 已自动验证）
-    let debug_mode = args.debug_inject;
-    if let Some(mode) = debug_mode {
-        log_info!("Debug 注入模式: {}", mode.description());
-    }
-
-    // === Debug 注入模式 ===
-    if let Some(mode) = debug_mode {
-        // 根据参数选择注入方式
-        let (target_pid, _host_fd): (i32, Option<RawFd>) = if let Some(ref package) = args.spawn {
-            spawn::register_cleanup_handler();
-            match spawn::spawn_and_inject_debug(package, &string_overrides, mode) {
-                Ok((pid, fd)) => (pid, fd),
-                Err(e) => {
-                    log_error!("Spawn debug 注入失败: {}", e);
-                    spawn::cleanup_zygote_patches();
-                    std::process::exit(1);
-                }
-            }
-        } else if let Some(pid) = resolved_pid {
-            match inject_debug(pid, mode, &string_overrides) {
-                Ok(fd) => (pid, fd),
-                Err(e) => {
-                    log_error!("Debug 注入失败: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            log_error!("Debug 模式需要 --pid、--name 或 --spawn 指定目标");
-            std::process::exit(1);
-        };
-
-        // 监控目标进程存活状态
-        monitor_process_alive(target_pid, 15);
-
-        // Spawn 模式：退出前还原 Zygote patch
-        if args.spawn.is_some() {
-            spawn::cleanup_zygote_patches();
-        }
-        return;
-    }
-
-    // === 正常注入模式 ===
-
     // 根据参数选择注入方式，返回 (target_pid, host_fd)
     let (target_pid, host_fd): (Option<i32>, RawFd) = if let Some(ref package) = args.spawn {
         // Spawn 模式：注册信号处理函数，确保 Ctrl+C 时还原 Zygote patch
@@ -145,7 +101,7 @@ fn main() {
         }
     } else if let Some(pid) = resolved_pid {
         // 直接附加到指定 PID（来自 --pid 或 --name 解析结果）
-        match inject_to_process(pid, &string_overrides) {
+        match inject_via_bootstrapper(pid, &string_overrides) {
             Ok(fd) => (Some(pid), fd),
             Err(e) => {
                 log_error!("注入失败: {}", e);
@@ -327,8 +283,10 @@ fn main() {
                 }
                 // Fix #1: loadjs/jseval/jsinit 都等待 EVAL:/EVAL_ERR: 响应并显示结果
                 // jsinit 也走 eval 等待，避免其 EVAL:initialized 响应污染后续 jseval 通道
+                let is_recomp = line.starts_with("recomp");
                 let is_eval_cmd =
-                    line.starts_with("jseval ") || line.starts_with("loadjs ") || line == "jsinit" || line == "jsclean";
+                    line.starts_with("jseval ") || line.starts_with("loadjs ") || line == "jsinit" || line == "jsclean"
+                    || is_recomp;
                 if is_eval_cmd {
                     eval_state().clear();
                 }
@@ -340,7 +298,7 @@ fn main() {
                     }
                 }
                 if is_eval_cmd {
-                    print_eval_result(5);
+                    print_eval_result(if is_recomp { 15 } else { 5 });
                 }
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
@@ -366,56 +324,3 @@ fn main() {
     let _ = handle.join();
 }
 
-/// Debug 模式：监控目标进程存活状态
-fn monitor_process_alive(pid: i32, duration_secs: u64) {
-    use crate::logger::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
-
-    log_info!("监控进程 {} 存活状态 ({}s)...", pid, duration_secs);
-
-    let start = std::time::Instant::now();
-    let mut death_sec: Option<u64> = None;
-
-    for sec in 1..=duration_secs {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-
-        let status_path = format!("/proc/{}/status", pid);
-        let alive = std::path::Path::new(&status_path).exists();
-
-        if alive {
-            print!(" {}{:>2}s{} {}✓ alive{}", DIM, sec, RESET, GREEN, RESET);
-        } else {
-            print!(" {}{:>2}s{} {}✗ KILLED{}", DIM, sec, RESET, RED, RESET);
-            if death_sec.is_none() {
-                death_sec = Some(sec);
-            }
-        }
-
-        // 每 5 个换行，或最后一行
-        if sec % 5 == 0 || sec == duration_secs {
-            println!();
-        }
-    }
-
-    println!();
-    let elapsed = start.elapsed().as_secs();
-
-    if let Some(sec) = death_sec {
-        log_error!("进程在第 {} 秒被杀", sec);
-
-        // 尝试从 /proc/pid/status 获取退出信号（如果还能读到）
-        // 进程已死，尝试用 logcat 获取死因提示
-        log_info!("{}建议检查:{}", YELLOW, RESET);
-        log_info!("  logcat --pid {} -d | tail -20", pid);
-        log_info!("  dmesg | grep -i 'killed\\|oom\\|signal'");
-
-        // 给出结论
-        println!();
-        println!(
-            "  {}结论:{} 进程存活了 {}~{}s{} 后被杀",
-            BOLD, RESET, YELLOW, sec, RESET
-        );
-    } else {
-        log_success!("进程在 {} 秒监控期内持续存活", elapsed);
-        println!("  {}结论:{} 当前模式下进程 {}未被检测{}", BOLD, RESET, GREEN, RESET);
-    }
-}

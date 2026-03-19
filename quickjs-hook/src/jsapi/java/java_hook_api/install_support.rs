@@ -1,7 +1,7 @@
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::output_message;
 
-use super::super::art_controller::stealth_flag;
+use super::super::art_controller::prepare_hook_target;
 use super::super::art_method::*;
 use super::super::callback::delete_replacement_method;
 use super::super::jni_core::*;
@@ -213,12 +213,16 @@ pub(super) unsafe fn install_per_method_router_hook(
 ) -> Result<Option<u64>, String> {
     if has_independent_code {
         let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
+        let (hook_addr, sflag) = prepare_hook_target(
+            original_entry_point as u64, env as *mut std::ffi::c_void)
+            .map_err(|e| format!("prepare_hook_target: {}", e))?;
         let trampoline = hook_ffi::hook_install_art_router(
-            original_entry_point as *mut std::ffi::c_void,
+            hook_addr as *mut std::ffi::c_void,
             ep_offset as u32,
-            stealth_flag(),
+            sflag,
             env as *mut std::ffi::c_void,
             &mut hooked_target,
+            1, // skip_resolve
         );
 
         if trampoline.is_null() {

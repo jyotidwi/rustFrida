@@ -16,7 +16,7 @@ use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::injection::{inject_debug, inject_to_process, DebugInjectMode};
+use crate::injection::inject_via_bootstrapper;
 use crate::proc_mem::ProcMem;
 use crate::process::{parse_proc_maps, wait_until_stopped, MapEntry};
 use crate::{log_error, log_info, log_step, log_success, log_verbose, log_warn};
@@ -287,7 +287,7 @@ pub(crate) fn spawn_and_inject(
     // 5. 注入 agent 到子进程
     let pid = hello.pid as i32;
     log_info!("正在向子进程 {} 注入 agent...", pid);
-    let host_fd = match inject_to_process(pid, string_overrides) {
+    let host_fd = match inject_via_bootstrapper(pid, string_overrides) {
         Ok(fd) => fd,
         Err(e) => {
             log_warn!("注入子进程 {} 失败，正在恢复子进程: {}", pid, e);
@@ -300,35 +300,6 @@ pub(crate) fn spawn_and_inject(
     //    子进程主线程仍阻塞在 zymbiote recv(ACK)，agent 线程可独立工作
 
     Ok((pid, host_fd))
-}
-
-/// Spawn + Debug 注入模式：启动 App 后使用 inject_debug 而非完整注入
-/// 返回 (pid, Option<RawFd>)
-pub(crate) fn spawn_and_inject_debug(
-    package: &str,
-    string_overrides: &HashMap<String, String>,
-    mode: DebugInjectMode,
-) -> Result<(i32, Option<RawFd>), String> {
-    log_info!("Spawn Debug 模式: 准备注入 {} ({})", package, mode.description());
-
-    let hello = spawn_and_wait_hello(package)?;
-
-    // 5. 使用 debug 模式注入
-    let pid = hello.pid as i32;
-    log_info!("正在向子进程 {} 执行 debug 注入 ({})...", pid, mode.description());
-    let result_fd = match inject_debug(pid, mode, string_overrides) {
-        Ok(fd) => fd,
-        Err(e) => {
-            log_warn!("Debug 注入子进程 {} 失败，正在恢复子进程: {}", pid, e);
-            let _ = resume_child(hello.pid);
-            return Err(e);
-        }
-    };
-
-    // 6. 恢复子进程
-    resume_child(hello.pid)?;
-
-    Ok((pid, result_fd))
 }
 
 /// 确保 zymbiote 已加载到所有 zygote 进程

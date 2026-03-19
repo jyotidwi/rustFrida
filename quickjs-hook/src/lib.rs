@@ -29,6 +29,7 @@ mod completion;
 pub mod context;
 pub mod ffi;
 pub mod jsapi;
+pub mod recomp;
 pub mod runtime;
 pub mod value;
 

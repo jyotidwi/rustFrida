@@ -16,6 +16,7 @@ mod communication;
 mod crash_handler;
 mod exec_mem;
 mod gumlibc;
+pub mod recompiler;
 mod trace;
 mod vma_name;
 
@@ -266,6 +267,57 @@ fn process_cmd(command: &str) {
             } else {
                 quickjs_loader::cleanup();
                 send_eval_ok("cleaned up");
+            }
+        }
+        Some("recomp") => {
+            let addr_str = command.split_whitespace().nth(1).unwrap_or("");
+            let addr_str = addr_str.strip_prefix("0x").unwrap_or(addr_str);
+            match usize::from_str_radix(addr_str, 16) {
+                Ok(addr) => match recompiler::recompile(addr, 0) {
+                    Ok((recomp_base, stats)) => {
+                        send_eval_ok(&format!(
+                            "recomp 0x{:x} → 0x{:x} (copied={} intra={} reloc={} tramp={})",
+                            addr, recomp_base, stats.num_copied, stats.num_intra_page,
+                            stats.num_direct_reloc, stats.num_trampolines
+                        ));
+                    }
+                    Err(e) => send_eval_err(&e),
+                },
+                Err(_) => send_eval_err("用法: recomp 0x<page_addr>"),
+            }
+        }
+        Some("recomp-release") => {
+            let addr_str = command.split_whitespace().nth(1).unwrap_or("");
+            let addr_str = addr_str.strip_prefix("0x").unwrap_or(addr_str);
+            match usize::from_str_radix(addr_str, 16) {
+                Ok(addr) => match recompiler::release(addr, 0) {
+                    Ok(_) => send_eval_ok("released"),
+                    Err(e) => send_eval_err(&e),
+                },
+                Err(_) => send_eval_err("用法: recomp-release 0x<page_addr>"),
+            }
+        }
+        Some("recomp-dry") => {
+            let addr_str = command.split_whitespace().nth(1).unwrap_or("");
+            let addr_str = addr_str.strip_prefix("0x").unwrap_or(addr_str);
+            match usize::from_str_radix(addr_str, 16) {
+                Ok(addr) => match recompiler::dry_run(addr) {
+                    Ok(output) => send_eval_ok(&output),
+                    Err(e) => send_eval_err(&e),
+                },
+                Err(_) => send_eval_err("用法: recomp-dry 0x<addr>"),
+            }
+        }
+        Some("recomp-list") => {
+            let pages = recompiler::list_pages();
+            if pages.is_empty() {
+                send_eval_ok("无重编译页");
+            } else {
+                let mut msg = String::new();
+                for (orig, recomp, tramp) in &pages {
+                    msg.push_str(&format!("0x{:x} → 0x{:x} (tramp={})\n", orig, recomp, tramp));
+                }
+                send_eval_ok(&msg);
             }
         }
         // shutdown — 先完整清理并输出日志，最后由 agent 主动关闭 socket

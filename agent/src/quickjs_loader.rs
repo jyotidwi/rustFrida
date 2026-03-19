@@ -99,6 +99,9 @@ pub fn init() -> Result<(), String> {
     // Initialize hook engine
     init_hook_engine(exec_mem.as_ptr(), exec_mem.size())?;
 
+    // 注册 recomp handler，供 JS hook("recomp") 模式使用
+    quickjs_hook::recomp::set_handler(|addr| crate::recompiler::ensure_and_translate(addr));
+
     if let Some(output_path) = crate::OUTPUT_PATH.get() {
         set_qbdi_output_dir(output_path.clone());
     }

@@ -1,4 +1,4 @@
-//! Hook registry: HookData, HOOK_REGISTRY, error constants
+//! Hook registry: StealthMode, HookData, HOOK_REGISTRY, error constants
 
 use crate::jsapi::callback_util::ensure_registry_initialized;
 use std::collections::HashMap;
@@ -30,11 +30,43 @@ pub(crate) fn hook_error_message(code: i32) -> &'static [u8] {
     }
 }
 
+/// Hook stealth 模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StealthMode {
+    /// 普通 inline hook（直接 patch 原始代码）
+    Normal = 0,
+    /// wxshadow stealth（内核 shadow page patch）
+    WxShadow = 1,
+    /// recomp stealth（页级重编译，在重编译页上 hook）
+    Recomp = 2,
+}
+
+/// JS 常量值
+pub(crate) const STEALTH_NORMAL: i32 = StealthMode::Normal as i32;
+pub(crate) const STEALTH_WXSHADOW: i32 = StealthMode::WxShadow as i32;
+pub(crate) const STEALTH_RECOMP: i32 = StealthMode::Recomp as i32;
+
+impl StealthMode {
+    /// 从 JS 参数解析 stealth 模式
+    /// - 0 / false / omitted → Normal
+    /// - 1 / true → WxShadow
+    /// - 2 → Recomp
+    pub(crate) fn from_js_arg(val: i64) -> Self {
+        match val {
+            1 => StealthMode::WxShadow,
+            2 => StealthMode::Recomp,
+            _ => StealthMode::Normal,
+        }
+    }
+}
+
 /// Stored hook callback data - stores raw bytes to avoid Send/Sync issues
 pub(crate) struct HookData {
     pub(crate) ctx: usize,               // Store as usize to avoid Send/Sync issues
     pub(crate) callback_bytes: [u8; 16], // JSValue is 16 bytes (u64 + i64)
     pub(crate) trampoline: u64,          // Trampoline address for callOriginal (replace mode)
+    pub(crate) mode: StealthMode,        // hook 模式（unhook 时需要）
+    pub(crate) recomp_addr: u64,         // Recomp 模式下的重编译地址
 }
 
 // SAFETY: HookData only contains Copy types now (usize, [u8; 16])

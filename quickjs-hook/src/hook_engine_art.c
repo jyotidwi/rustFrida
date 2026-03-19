@@ -258,7 +258,7 @@ static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
  *          Typically Thread* = JNIEnv* - 0 (JNIEnv is the first field).
  * ============================================================================ */
 
-static void* resolve_art_trampoline(void* target, void* jni_env) {
+void* resolve_art_trampoline(void* target, void* jni_env) {
     if (!target || !jni_env) return target;
 
     /* Read first two instructions */
@@ -308,16 +308,19 @@ static void* resolve_art_trampoline(void* target, void* jni_env) {
 
 void* hook_install_art_router(void* target, uint32_t quickcode_offset,
                                int stealth, void* jni_env,
-                               void** out_hooked_target) {
+                               void** out_hooked_target,
+                               int skip_resolve) {
     if (!g_engine.initialized || !target) {
         return NULL;
     }
 
     /* Resolve tiny ART trampolines (LDR+BR 8 bytes) to actual target */
-    void* resolved = resolve_art_trampoline(target, jni_env);
-    if (resolved != target) {
-        hook_log("[art_router] resolved %p → %p", target, resolved);
-        target = resolved;
+    if (!skip_resolve) {
+        void* resolved = resolve_art_trampoline(target, jni_env);
+        if (resolved != target) {
+            hook_log("[art_router] resolved %p → %p", target, resolved);
+            target = resolved;
+        }
     }
 
     /* Report the actual hooked address back to the caller for cleanup */

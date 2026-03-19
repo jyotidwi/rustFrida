@@ -11,8 +11,7 @@ use std::mem::size_of_val;
 use std::path::Path;
 use std::process;
 
-use crate::log_success;
-use crate::log_warn;
+use crate::{log_info, log_success, log_warn};
 use crate::types::UserRegs;
 
 /// 获取指定库的基址
@@ -20,6 +19,7 @@ use crate::types::UserRegs;
 /// # 参数
 /// * `pid`      - 进程ID，`None` 表示查询当前进程
 /// * `lib_name` - 要查找的库名称（如 "libc.so"、"libdl.so"）
+#[allow(dead_code)]
 pub(crate) fn get_lib_base(pid: Option<i32>, lib_name: &str) -> Result<usize, String> {
     let maps_path = match pid {
         Some(pid) => format!("/proc/{}/maps", pid),
@@ -67,8 +67,36 @@ fn find_map_line_for_addr(pid: i32, addr: u64) -> Option<String> {
     None
 }
 
+/// 解冻 cgroup v2 freezer（Android 12+ 会冻结后台进程）
+/// 冻结状态下 ptrace attach 的 SIGSTOP 无法送达，waitpid 会永远阻塞。
+fn thaw_cgroup_freezer(pid: i32) {
+    // cgroup v2 freezer 路径格式：/sys/fs/cgroup/<slice>/uid_<uid>/pid_<pid>/cgroup.freeze
+    let cgroup_path = format!("/proc/{}/cgroup", pid);
+    let content = match std::fs::read_to_string(&cgroup_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // 解析 cgroup 路径，例如 "0::/system/uid_1000/pid_13323"
+    for line in content.lines() {
+        let parts: Vec<&str> = line.splitn(3, ':').collect();
+        if parts.len() == 3 {
+            let cgroup_rel = parts[2].trim_start_matches('/');
+            let freeze_path = format!("/sys/fs/cgroup/{}/cgroup.freeze", cgroup_rel);
+            if let Ok(val) = std::fs::read_to_string(&freeze_path) {
+                if val.trim() == "1" {
+                    log_info!("解冻 cgroup freezer: {}", freeze_path);
+                    let _ = std::fs::write(&freeze_path, "0");
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
     let target_pid = Pid::from_raw(pid);
+
+    // 解冻 cgroup freezer（Android 12+ 后台进程可能被冻结）
+    thaw_cgroup_freezer(pid);
 
     // 尝试附加到目标进程
     match ptrace::attach(target_pid) {
@@ -91,6 +119,11 @@ pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
             Err(err_msg.to_string())
         }
     }
+}
+
+/// 获取进程寄存器（pub 接口供 code-swap 使用）
+pub(crate) fn get_registers_pub(pid: i32) -> Result<UserRegs, String> {
+    get_registers(pid)
 }
 
 /// 获取进程寄存器
@@ -170,6 +203,17 @@ pub(crate) fn call_target_function(
     // 写入新寄存器值
     set_registers(pid, &new_regs)?;
 
+    // 验证寄存器是否正确设置
+    {
+        let verify = get_registers(pid)?;
+        if verify.pc != new_regs.pc {
+            log_warn!("PC 设置验证失败: 期望 0x{:x}, 实际 0x{:x}", new_regs.pc, verify.pc);
+        }
+        if verify.regs[30] != new_regs.regs[30] {
+            log_warn!("LR 设置验证失败: 期望 0x{:x}, 实际 0x{:x}", new_regs.regs[30], verify.regs[30]);
+        }
+    }
+
     // 继续执行
     if debug.unwrap_or(false) {
         let _ = ptrace::cont(Pid::from_raw(pid), Some(Signal::SIGSTOP));
@@ -182,7 +226,7 @@ pub(crate) fn call_target_function(
     // 子进程 raise(SIGSTOP) + ptrace attach 的 SIGSTOP 会产生 pending 信号，
     // 导致 PTRACE_CONT 后进程立即被 SIGSTOP 再次停止。
     // 遇到 SIGSTOP 时吞掉信号并重新 CONT，最多重试 3 次。
-    let max_sigstop_retries = 3;
+    let max_sigstop_retries = 50; // 多线程进程可能产生大量信号
     for attempt in 0..=max_sigstop_retries {
         let result = unsafe { libc::ptrace(PTRACE_CONT as c_int, pid as pid_t, 0, 0) };
 
@@ -192,10 +236,22 @@ pub(crate) fn call_target_function(
             }));
         }
 
-        // 等待进程停止
+        // 等待进程停止（可能收到其他线程的信号，需要过滤）
         match waitpid(target_pid, None).map_err(|e| format!("等待进程失败: {}", e))? {
+            WaitStatus::Stopped(stopped_pid, Signal::SIGSEGV) if stopped_pid.as_raw() != pid => {
+                // 其他线程的 SIGSEGV，转发信号并继续等待
+                log_warn!("其他线程 {} 收到 SIGSEGV，转发并继续", stopped_pid);
+                let _ = unsafe { libc::ptrace(PTRACE_CONT as c_int, stopped_pid.as_raw() as pid_t, 0, libc::SIGSEGV) };
+                continue;
+            }
+            WaitStatus::Stopped(stopped_pid, sig) if stopped_pid.as_raw() != pid && sig != Signal::SIGSTOP => {
+                // 其他线程的其他信号，转发并继续
+                log_warn!("其他线程 {} 收到 {:?}，转发并继续", stopped_pid, sig);
+                let _ = unsafe { libc::ptrace(PTRACE_CONT as c_int, stopped_pid.as_raw() as pid_t, 0, sig as i32) };
+                continue;
+            }
             WaitStatus::Stopped(_, Signal::SIGSEGV) => {
-                // 获取寄存器，检查 PC 是否为预期值
+                // 目标线程的 SIGSEGV — 检查 PC 是否为预期值
                 let regs = get_registers(pid)?;
 
                 if regs.pc == 0x340 {
@@ -217,7 +273,8 @@ pub(crate) fn call_target_function(
                             "PC=0x{:x} [{}], ",
                             "LR=0x{:x} [{}], ",
                             "SP=0x{:x}, ",
-                            "X0=0x{:x}, X1=0x{:x}, X2=0x{:x}, X3=0x{:x}"
+                            "X0=0x{:x}, X1=0x{:x}, X2=0x{:x}, X3=0x{:x}\n\
+                         X19=0x{:x}, X20=0x{:x}, X21=0x{:x}, X22=0x{:x}, X29=0x{:x}"
                         ),
                         regs.pc,
                         pc_map,
@@ -227,7 +284,12 @@ pub(crate) fn call_target_function(
                         regs.regs[0],
                         regs.regs[1],
                         regs.regs[2],
-                        regs.regs[3]
+                        regs.regs[3],
+                        regs.regs[19],
+                        regs.regs[20],
+                        regs.regs[21],
+                        regs.regs[22],
+                        regs.regs[29]
                     ));
                 }
             }
@@ -239,6 +301,15 @@ pub(crate) fn call_target_function(
                 } else {
                     return Err("多次 SIGSTOP 中断，无法执行目标函数".to_string());
                 }
+            }
+            WaitStatus::Stopped(_, sig) => {
+                let regs = get_registers(pid).ok();
+                let info = if let Some(r) = &regs {
+                    format!("PC=0x{:x} LR=0x{:x} X0=0x{:x}", r.pc, r.regs[30], r.regs[0])
+                } else {
+                    "regs unavailable".into()
+                };
+                return Err(format!("进程异常停止: {:?} {}", sig, info));
             }
             status => return Err(format!("进程异常停止: {:?}", status)),
         }
@@ -340,7 +411,7 @@ pub(crate) fn write_bytes(pid: i32, addr: usize, data: &[u8]) -> Result<(), Stri
 /// * `pid` - 目标进程ID
 /// * `addr` - 目标地址
 /// * `size` - 读取字节数
-fn read_remote_mem(pid: i32, addr: usize, size: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn read_remote_mem(pid: i32, addr: usize, size: usize) -> Result<Vec<u8>, String> {
     let addr = addr & 0x00FFFFFFFFFFFFFF; // 去掉 MTE 标签位
     let mut result = vec![0u8; size];
     let mut offset = 0;

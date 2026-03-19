@@ -15,7 +15,9 @@ fn main() {
         .file(src_path.join("hook_engine_art.c"))
         .file(src_path.join("arm64_writer.c"))
         .file(src_path.join("arm64_relocator.c"))
+        .file(src_path.join("recomp/recomp_page.c"))
         .include(&src_path)
+        .include(src_path.join("recomp"))
         .opt_level(2)
         .flag("-fPIC")
         .flag("-fno-exceptions")
@@ -108,6 +110,7 @@ fn main() {
         .header(src_path.join("hook_engine.h").to_string_lossy().to_string())
         .header(src_path.join("arm64_writer.h").to_string_lossy().to_string())
         .header(src_path.join("arm64_relocator.h").to_string_lossy().to_string())
+        .header(src_path.join("recomp/recomp_page.h").to_string_lossy().to_string())
         .clang_arg(format!("-I{}", src_path.display()))
         .clang_arg("-xc")
         .generate_comments(true)
@@ -117,9 +120,13 @@ fn main() {
         .allowlist_function("hook_.*")
         .allowlist_function("arm64_writer_.*")
         .allowlist_function("arm64_relocator_.*")
+        .allowlist_function("recompile_page")
+        .allowlist_function("resolve_art_trampoline")
         .allowlist_type("Hook.*")
         .allowlist_type("Arm64.*")
+        .allowlist_type("RecompileStats")
         .allowlist_var("ARM64_.*")
+        .allowlist_var("RECOMP_.*")
         .use_core()
         .generate()
         .expect("Unable to generate hook_engine bindings");
@@ -140,6 +147,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/arm64_writer.h");
     println!("cargo:rerun-if-changed=src/arm64_relocator.c");
     println!("cargo:rerun-if-changed=src/arm64_relocator.h");
+    println!("cargo:rerun-if-changed=src/recomp/recomp_page.c");
+    println!("cargo:rerun-if-changed=src/recomp/recomp_page.h");
     println!("cargo:rerun-if-changed=quickjs-src/VERSION");
     println!("cargo:rerun-if-changed=quickjs-src/quickjs.c");
     println!("cargo:rerun-if-changed=quickjs-src/quickjs.h");

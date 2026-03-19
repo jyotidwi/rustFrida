@@ -53,7 +53,8 @@ use crate::jsapi::console::output_message;
 use crate::jsapi::util::add_cfunction_to_object;
 use crate::value::JSValue;
 
-use art_controller::{is_stealth_enabled, set_stealth_enabled};
+use art_controller::{set_stealth_mode, stealth_mode};
+use crate::jsapi::hook_api::StealthMode;
 use art_method::try_invalidate_jit_cache;
 use callback::*;
 use java_field_api::*;
@@ -255,9 +256,9 @@ unsafe extern "C" fn js_art_router_debug(
     JSValue::bool(true).raw()
 }
 
-/// JS CFunction: Java.setStealth(enabled) — 启用/禁用 wxshadow stealth 模式
+/// JS CFunction: Java.setStealth(mode) — 设置 stealth 模式
 ///
-/// 启用后所有 inline hook 优先尝试 wxshadow，内核不支持则自动 fallback 到 mprotect。
+/// mode: Hook.NORMAL (0) / false, Hook.WXSHADOW (1) / true, Hook.RECOMP (2)
 /// 建议在首次 Java.hook() 之前调用，否则已安装的 Layer 1/2 hook 不受影响。
 unsafe extern "C" fn js_java_set_stealth(
     ctx: *mut ffi::JSContext,
@@ -268,23 +269,34 @@ unsafe extern "C" fn js_java_set_stealth(
     if argc < 1 {
         return ffi::JS_ThrowTypeError(
             ctx,
-            b"Java.setStealth() requires 1 argument: boolean\0".as_ptr() as *const _,
+            b"Java.setStealth() requires 1 argument: Hook.NORMAL/WXSHADOW/RECOMP or bool\0".as_ptr() as *const _,
         );
     }
     let arg = JSValue(*argv);
-    let enabled = arg.to_bool().unwrap_or(false);
-    set_stealth_enabled(enabled);
-    JSValue::bool(enabled).raw()
+    // 向后兼容: true → WxShadow, false → Normal
+    // 数字: 0=Normal, 1=WxShadow, 2=Recomp
+    let mode = match arg.to_i64(ctx) {
+        Some(v) => StealthMode::from_js_arg(v),
+        None => {
+            if arg.to_bool() == Some(true) {
+                StealthMode::WxShadow
+            } else {
+                StealthMode::Normal
+            }
+        }
+    };
+    set_stealth_mode(mode);
+    ffi::JS_NewBigUint64(ctx, mode as u64)
 }
 
-/// JS CFunction: Java.getStealth() — 查询 stealth 开关状态
+/// JS CFunction: Java.getStealth() — 查询当前 stealth 模式
 unsafe extern "C" fn js_java_get_stealth(
     _ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    JSValue::bool(is_stealth_enabled()).raw()
+    ffi::JS_NewBigUint64(_ctx, stealth_mode() as u64)
 }
 
 /// JS CFunction: Java._updateClassLoader(ptr) — 更新缓存的 app ClassLoader
