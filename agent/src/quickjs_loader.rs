@@ -55,9 +55,7 @@ impl ExecMemory {
             fn hook_mmap_near(target: *mut std::ffi::c_void, alloc_size: usize) -> *mut std::ffi::c_void;
         }
 
-        let ptr = unsafe {
-            hook_mmap_near(hint as *mut std::ffi::c_void, alloc_size)
-        };
+        let ptr = unsafe { hook_mmap_near(hint as *mut std::ffi::c_void, alloc_size) };
 
         if ptr == MAP_FAILED as *mut std::ffi::c_void {
             return None;
@@ -68,7 +66,10 @@ impl ExecMemory {
             Err(_) => {}
         }
 
-        Some(ExecMemory { ptr: ptr as *mut u8, size: alloc_size })
+        Some(ExecMemory {
+            ptr: ptr as *mut u8,
+            size: alloc_size,
+        })
     }
 
     fn new(size: usize) -> Option<Self> {
@@ -104,10 +105,8 @@ pub fn init() -> Result<(), String> {
 
     // Allocate executable memory for hooks (64KB), near libart.so for ADRP range
     let libart_hint = find_libart_base().unwrap_or(0);
-    let exec_mem = EXEC_MEM.get_or_init(|| {
-        ExecMemory::new_near(64 * 1024, libart_hint)
-            .expect("Failed to allocate executable memory")
-    });
+    let exec_mem = EXEC_MEM
+        .get_or_init(|| ExecMemory::new_near(64 * 1024, libart_hint).expect("Failed to allocate executable memory"));
 
     // Initialize hook engine
     init_hook_engine(exec_mem.as_ptr(), exec_mem.size())?;
@@ -115,7 +114,8 @@ pub fn init() -> Result<(), String> {
     // 注册 recomp handlers
     quickjs_hook::recomp::set_handler(|addr| crate::recompiler::ensure_and_translate(addr));
     quickjs_hook::recomp::set_alloc_slot_handler(|addr| crate::recompiler::alloc_trampoline_slot(addr));
-
+    quickjs_hook::recomp::set_fixup_handler(|trampoline, addr| crate::recompiler::fixup_slot_trampoline(trampoline, addr));
+    quickjs_hook::recomp::set_commit_handler(|addr| crate::recompiler::commit_slot_patch(addr));
 
     if let Some(output_path) = crate::OUTPUT_PATH.get() {
         set_qbdi_output_dir(output_path.clone());
@@ -176,7 +176,11 @@ pub fn is_initialized() -> bool {
 pub fn cleanup() {
     log_msg("[quickjs] cleanup start\n".to_string());
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
-    // Unhook Java hooks first (restore ArtMethod entry points)
+    // 第一步: 释放 recomp 页 — 注销 prctl，内核立即停止重定向执行到 recomp 页。
+    // 必须最先执行: 后续 cleanup 会恢复 ArtMethod/slot，如果 recomp 仍在生效，
+    // 其他线程走 recomp 页 → B→已恢复的 slot (BRK guard) → SIGTRAP。
+    crate::recompiler::release_all();
+    // Unhook Java hooks (restore ArtMethod entry points + flags)
     log_msg("[quickjs] cleanup_java_hooks\n".to_string());
     cleanup_java_hooks();
     // Unhook all inline hooks while the JS context (ctx) is still valid

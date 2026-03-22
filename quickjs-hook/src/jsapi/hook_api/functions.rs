@@ -100,8 +100,8 @@ unsafe fn install_hook(
 
     let callback_bytes = dup_callback_to_bytes(ctx, callback_arg.raw());
 
-    // Recomp 模式下 hook engine 只需在 slot 上写 full jump (stealth=0)，
-    // B 指令已由 alloc_trampoline_slot 写好。
+    // Recomp 模式下 hook engine 在 slot 上写 full jump (stealth=0)，
+    // alloc_trampoline_slot 只分配 slot，B 指令在 fixup+commit 后才写入。
     let stealth_flag = match mode {
         StealthMode::WxShadow => 1,
         _ => 0,
@@ -118,6 +118,12 @@ unsafe fn install_hook(
         let callback: ffi::JSValue = std::ptr::read(callback_bytes.as_ptr() as *const ffi::JSValue);
         ffi::qjs_free_value(ctx, callback);
         return throw_internal_error(ctx, "hook_replace failed: could not install hook");
+    }
+
+    // Recomp: fixup trampoline + commit B 指令
+    if mode == StealthMode::Recomp {
+        let _ = crate::recomp::fixup_slot_trampoline(trampoline as *mut u8, addr as usize);
+        let _ = crate::recomp::commit_slot_patch(addr as usize);
     }
 
     with_registry_mut(&HOOK_REGISTRY, |registry| {

@@ -158,6 +158,14 @@ void hook_engine_cleanup(void);
  * 返回 0 成功，-1 失败（pool 数量已满）。 */
 int hook_register_pool(void* base, size_t size);
 
+/* 重建 trampoline: 将 orig_bytes (4字节) 从 orig_pc 重定位到 trampoline，
+ * 然后追加绝对跳转到 jump_back_target。
+ * 用途: stealth2 slot 模式下修复 hook engine 自动生成的错误 trampoline。
+ * 返回 trampoline 写入的总字节数，<0 失败。 */
+int hook_rebuild_trampoline(void* trampoline, size_t trampoline_size,
+                            const void* orig_bytes, uint64_t orig_pc,
+                            void* jump_back_target);
+
 /* Allocate from any pool (legacy, no locality guarantee) */
 void* hook_alloc(size_t size);
 

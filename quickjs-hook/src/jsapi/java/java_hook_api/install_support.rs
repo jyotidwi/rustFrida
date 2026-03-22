@@ -232,6 +232,9 @@ pub(super) unsafe fn install_per_method_router_hook(
             return Err("hook_install_art_router failed".to_string());
         }
 
+        // stealth2: 修复 trampoline（hook engine 从 slot 读到的是清零字节）
+        super::super::art_controller::try_fixup_trampoline_pub(trampoline, original_entry_point);
+
         // clone 的 entry_point 设为 interpreter_bridge (对标 Frida):
         // 让 callOriginal 走解释器执行 DEX bytecode，而不是 trampoline (relocated OAT code)。
         // trampoline 的 PC 在 hook engine 内存中，不在原方法 OAT code range 内，

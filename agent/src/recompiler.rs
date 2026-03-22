@@ -52,6 +52,13 @@ extern "C" {
     fn hook_write_jump(dst: *mut libc::c_void, target: *mut libc::c_void) -> i32;
     fn hook_mmap_near(target: *mut libc::c_void, alloc_size: usize) -> *mut libc::c_void;
     fn hook_register_pool(base: *mut libc::c_void, size: usize) -> i32;
+    fn hook_rebuild_trampoline(
+        trampoline: *mut libc::c_void,
+        trampoline_size: usize,
+        orig_bytes: *const u8,
+        orig_pc: u64,
+        jump_back_target: *mut libc::c_void,
+    ) -> i32;
 }
 
 /// C 侧的 RecompileStats 对应结构
@@ -97,6 +104,16 @@ impl From<&RecompileStatsC> for RecompileStats {
     }
 }
 
+/// alloc_trampoline_slot 保存的原始指令信息
+struct SlotInfo {
+    /// recomp 代码页上被 B 覆盖的地址
+    recomp_addr: usize,
+    /// slot 地址（跳板区）
+    slot_addr: usize,
+    /// 被覆盖前的原始 4 字节指令
+    orig_insn: [u8; 4],
+}
+
 /// 一个已重编译的页
 struct RecompiledPage {
     /// 原始页基地址（用于内核注销时传参）
@@ -112,6 +129,8 @@ struct RecompiledPage {
     tramp_capacity: usize,
     /// 是否已在内核注册
     registered: bool,
+    /// slot 分配记录: orig_addr → (recomp_addr, 原始指令)
+    slots: HashMap<usize, SlotInfo>,
 }
 
 // SAFETY: 指针只在当前进程内使用，由 Mutex 保护
@@ -166,10 +185,9 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
     let _ = set_anon_vma_name_raw(recomp_ptr, PAGE_SIZE, VMA_RECOMP_CODE);
     let _ = set_anon_vma_name_raw(tramp_ptr, tramp_capacity, VMA_RECOMP_TRAMP);
 
-    // 刷新 icache + 代码页设为 R-X；跳板区保持 RWX（alloc_trampoline_slot 需要写 B 指令 + slot 数据）
+    // 刷新 icache（整个区域保持 RWX，后续 alloc_trampoline_slot 直接写，无需 mprotect）
     unsafe {
         hook_flush_cache(recomp_ptr as *mut _, PAGE_SIZE + tramp_used);
-        mprotect(recomp_ptr as *mut _, PAGE_SIZE, PROT_READ | PROT_EXEC);
     }
 
     log_msg(format!(
@@ -201,9 +219,13 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
         ));
         false
     } else {
+        // 验证 prctl 注册后 recomp 区域权限是否被改变
+        let test_ptr = unsafe { recomp_ptr.add(PAGE_SIZE + tramp_used) };
+        let test_val = unsafe { std::ptr::read_volatile(test_ptr) };
+        unsafe { std::ptr::write_volatile(test_ptr, test_val) }; // 写回相同值，测试写权限
         log_msg(format!(
-            "[recompiler] prctl 注册成功: 0x{:x} → 0x{:x}",
-            orig_base, recomp_base
+            "[recompiler] prctl 注册成功: 0x{:x} → 0x{:x} (write-test ok at tramp+{})",
+            orig_base, recomp_base, tramp_used
         ));
         true
     };
@@ -215,6 +237,7 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
         recomp_total_size: total_size,
         tramp_used,
         tramp_capacity,
+        slots: HashMap::new(),
         registered,
     };
 
@@ -260,6 +283,41 @@ pub fn release(addr: usize, pid: u32) -> Result<()> {
 
     log_msg(format!("[recompiler] 释放 0x{:x}", orig_base));
     Ok(())
+}
+
+/// 释放所有重编译页（agent cleanup 时调用）
+///
+/// 注销所有 prctl 注册 + munmap。释放后内核不再重定向执行到 recomp 页，
+/// 原始页恢复 X 权限，代码从原始位置正常执行。
+pub fn release_all() {
+    ensure_init();
+
+    let mut guard = RECOMP_PAGES.lock().unwrap();
+    let pages = match guard.as_mut() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let keys: Vec<usize> = pages.keys().cloned().collect();
+    for orig_base in keys {
+        if let Some(page) = pages.remove(&orig_base) {
+            if page.registered {
+                unsafe {
+                    libc::prctl(
+                        PR_RECOMPILE_RELEASE,
+                        0u64,
+                        orig_base as u64,
+                        0u64,
+                        0u64,
+                    );
+                }
+            }
+            // 不 munmap: prctl release 后内核恢复原始页 X 权限，
+            // 但其他线程可能仍在 recomp 页上执行（icache 里有旧指令）。
+            // 保留 recomp 页直到进程退出，避免 SIGSEGV。
+        }
+    }
+    log_msg("[recompiler] release_all: 所有 recomp 页已释放".to_string());
 }
 
 /// 获取重编译页的可写指针（用于 hook 修改代码）
@@ -344,28 +402,11 @@ pub fn patch_insns(addr: usize, insns: &[u32]) -> Result<()> {
     }
 
     unsafe {
-        // 临时加写权限
-        mprotect(
-            page.recomp_ptr as *mut _,
-            page.recomp_total_size,
-            PROT_READ | PROT_WRITE | PROT_EXEC,
-        );
-
-        // 写入指令
         let dst = page.recomp_ptr.add(offset) as *mut u32;
         for (i, &insn) in insns.iter().enumerate() {
             ptr::write_volatile(dst.add(i), insn);
         }
-
-        // 刷新 icache
         hook_flush_cache(page.recomp_ptr.add(offset) as *mut _, patch_size);
-
-        // 恢复权限
-        mprotect(
-            page.recomp_ptr as *mut _,
-            page.recomp_total_size,
-            PROT_READ | PROT_EXEC,
-        );
     }
 
     Ok(())
@@ -405,17 +446,9 @@ pub fn patch_with_trampoline(orig_addr: usize, jump_dest: usize) -> Result<usize
     let slot_addr = slot_ptr as usize;
 
     unsafe {
-        // 临时加写权限
-        mprotect(
-            page.recomp_ptr as *mut _,
-            page.recomp_total_size,
-            PROT_READ | PROT_WRITE | PROT_EXEC,
-        );
-
         // 1. 在跳板 slot 写 full jump → jump_dest
         let jump_len = hook_write_jump(slot_ptr as *mut _, jump_dest as *mut _);
         if jump_len <= 0 {
-            mprotect(page.recomp_ptr as *mut _, page.recomp_total_size, PROT_READ | PROT_EXEC);
             return Err(format!("hook_write_jump failed: {}", jump_len));
         }
 
@@ -423,23 +456,14 @@ pub fn patch_with_trampoline(orig_addr: usize, jump_dest: usize) -> Result<usize
         let recomp_code_addr = page.recomp_ptr.add(offset) as usize;
         let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);
         if b_offset < -(1 << 27) || b_offset >= (1 << 27) {
-            mprotect(page.recomp_ptr as *mut _, page.recomp_total_size, PROT_READ | PROT_EXEC);
             return Err(format!("B 指令范围超限: offset={}", b_offset));
         }
         let b_imm26 = ((b_offset >> 2) & 0x3FF_FFFF) as u32;
         let b_insn: u32 = 0x14000000 | b_imm26;
         ptr::write_volatile(recomp_code_addr as *mut u32, b_insn);
 
-        // 刷新 icache
         hook_flush_cache(slot_ptr as *mut _, jump_len as usize);
         hook_flush_cache(recomp_code_addr as *mut _, 4);
-
-        // 恢复权限
-        mprotect(
-            page.recomp_ptr as *mut _,
-            page.recomp_total_size,
-            PROT_READ | PROT_EXEC,
-        );
     }
 
     page.tramp_used += slot_size;
@@ -476,37 +500,107 @@ pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
     let slot_addr = slot_ptr as usize;
     let recomp_code_addr = unsafe { page.recomp_ptr.add(offset) as usize };
 
-    // B 指令范围检查 (±128MB)
+    // 保存 recomp 代码页上将被 B 覆盖的原始指令
+    let mut orig_insn = [0u8; 4];
+    unsafe {
+        ptr::copy_nonoverlapping(recomp_code_addr as *const u8, orig_insn.as_mut_ptr(), 4);
+    }
+
+    // 清零 slot 区域（recomp BRK guard 填充）
+    unsafe {
+        ptr::write_bytes(slot_ptr, 0, slot_size);
+    }
+
+    // B 指令范围预检查（commit_slot_patch 时才真正写入）
     let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);
     if b_offset < -(1 << 27) || b_offset >= (1 << 27) {
         return Err(format!("B 指令范围超限: offset={}", b_offset));
     }
 
+    page.tramp_used += slot_size;
+    page.slots.insert(orig_addr, SlotInfo { recomp_addr: recomp_code_addr, slot_addr, orig_insn });
+    // 注意: 此时 recomp 代码页上的原始指令未被修改，slot 已分配但内容是 0。
+    // 调用方必须在 hook engine 写好 thunk + fixup trampoline 后调用 commit_slot_patch。
+    Ok(slot_addr)
+}
+
+/// 在 recomp 代码页上写 B→slot 指令（原子 4 字节写入）。
+///
+/// 必须在 hook engine 已将 thunk 写入 slot 之后调用。
+/// B 指令写入后，其他线程执行到此处会立即跳到 slot 里的 thunk。
+pub fn commit_slot_patch(orig_addr: usize) -> Result<()> {
+    ensure_init();
+
+    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let orig_base = orig_addr & !(page_size - 1);
+
+    let guard = RECOMP_PAGES.lock().unwrap();
+    let pages = guard.as_ref().unwrap();
+
+    let page = match pages.get(&orig_base) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    let info = match page.slots.get(&orig_addr) {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+
+    let recomp_code_addr = info.recomp_addr;
+    let slot_addr = info.slot_addr;
+    let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);
+    let b_imm26 = ((b_offset >> 2) & 0x3FF_FFFF) as u32;
+    let b_insn: u32 = 0x14000000 | b_imm26;
+
     unsafe {
-        // 临时加写权限
-        mprotect(
-            page.recomp_ptr as *mut _,
-            page.recomp_total_size,
-            PROT_READ | PROT_WRITE | PROT_EXEC,
-        );
-
-        // 在 recomp 代码页写 B slot
-        let b_imm26 = ((b_offset >> 2) & 0x3FF_FFFF) as u32;
-        let b_insn: u32 = 0x14000000 | b_imm26;
+        // 原子 4 字节写入 + icache flush
         ptr::write_volatile(recomp_code_addr as *mut u32, b_insn);
-
-        hook_flush_cache(recomp_code_addr as *mut _, 4);
-
-        // 恢复权限
-        mprotect(
-            page.recomp_ptr as *mut _,
-            page.recomp_total_size,
-            PROT_READ | PROT_EXEC,
-        );
+        hook_flush_cache(recomp_code_addr as *mut libc::c_void, 4);
     }
 
-    page.tramp_used += slot_size;
-    Ok(slot_addr)
+    Ok(())
+}
+
+/// 修复 hook engine 为 slot 自动生成的 trampoline。
+///
+/// hook engine 的 build_trampoline 从 slot 地址读 "original bytes"（清零后是 NOP/0），
+/// 生成的 trampoline 无法正确 call original。本函数用 recomp 代码页上被 B 覆盖的
+/// 真正原始指令重建 trampoline: 重定位原始指令 + 跳回 recomp_addr+4。
+pub fn fixup_slot_trampoline(trampoline: *mut u8, orig_addr: usize) -> Result<()> {
+    ensure_init();
+
+    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let orig_base = orig_addr & !(page_size - 1);
+
+    let guard = RECOMP_PAGES.lock().unwrap();
+    let pages = guard.as_ref().unwrap();
+
+    let page = match pages.get(&orig_base) {
+        Some(p) => p,
+        None => return Ok(()), // 非 recomp 模式，无需 fixup
+    };
+
+    let info = match page.slots.get(&orig_addr) {
+        Some(i) => i,
+        None => return Ok(()), // 无 slot 记录（非 stealth2 路径或已释放）
+    };
+
+    let ret = unsafe {
+        hook_rebuild_trampoline(
+            trampoline as *mut libc::c_void,
+            256, // TRAMPOLINE_ALLOC_SIZE
+            info.orig_insn.as_ptr(),
+            info.recomp_addr as u64,
+            (info.recomp_addr + 4) as *mut libc::c_void,
+        )
+    };
+
+    if ret < 0 {
+        return Err(format!("hook_rebuild_trampoline failed: {}", ret));
+    }
+
+    Ok(())
 }
 
 /// 临时重编译结果（mmap 分配 + C 重编译，不注册 prctl）

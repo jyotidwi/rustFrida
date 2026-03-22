@@ -75,6 +75,29 @@ pub(super) fn stealth_mode() -> StealthMode {
     StealthMode::from_js_arg(STEALTH_MODE.load(Ordering::Relaxed) as i64)
 }
 
+/// stealth2 slot 模式 trampoline 修复：hook engine 从 slot 读到的是清零字节，
+/// 自动生成的 trampoline 无法 call original。用 recomp 页被覆盖的真正原始指令重建。
+/// 非 recomp 模式或无 slot 记录时静默返回。
+/// 安全包装: install_support.rs 调用
+pub(super) fn try_fixup_trampoline_pub(trampoline: *mut std::ffi::c_void, orig_addr: u64) {
+    unsafe { try_fixup_trampoline(trampoline, orig_addr) };
+}
+
+unsafe fn try_fixup_trampoline(trampoline: *mut std::ffi::c_void, orig_addr: u64) {
+    if trampoline.is_null() || stealth_mode() != StealthMode::Recomp {
+        return;
+    }
+    // 1. 用真正的原始指令重建 trampoline
+    if let Err(e) = crate::recomp::fixup_slot_trampoline(trampoline as *mut u8, orig_addr as usize) {
+        output_message(&format!("[stealth2] fixup_trampoline {:#x}: {}", orig_addr, e));
+        return;
+    }
+    // 2. thunk + trampoline 都就绪，原子写 B 指令激活 hook
+    if let Err(e) = crate::recomp::commit_slot_patch(orig_addr as usize) {
+        output_message(&format!("[stealth2] commit_slot_patch {:#x}: {}", orig_addr, e));
+    }
+}
+
 /// 统一地址准备：resolve ART trampoline + stealth 翻译
 ///
 /// 返回 (hook_addr, stealth_flag):
@@ -368,6 +391,8 @@ pub(super) fn ensure_art_controller_initialized(
             )
         };
         if !trampoline.is_null() {
+            // stealth2: 修复 trampoline（hook engine 从 slot 读到的是清零字节）
+            unsafe { try_fixup_trampoline(trampoline, *addr) };
             // 使用实际被 hook 的地址 (可能经过 resolve_art_trampoline 解析)
             let actual_target = if !hooked_target.is_null() {
                 hooked_target as u64
@@ -399,13 +424,12 @@ pub(super) fn ensure_art_controller_initialized(
         if addr == 0 {
             continue;
         }
+        let (ha, sf) = unsafe { prepare_hook_target(addr, std::ptr::null_mut()) }.unwrap_or((addr, 0));
         let ret = unsafe {
-            {
-                let (ha, sf) = prepare_hook_target(addr, std::ptr::null_mut()).map_err(|e| e).unwrap_or((addr, 0));
-                hook_ffi::hook_attach(ha as *mut std::ffi::c_void, Some(on_do_call_enter), None, std::ptr::null_mut(), sf)
-            }
+            hook_ffi::hook_attach(ha as *mut std::ffi::c_void, Some(on_do_call_enter), None, std::ptr::null_mut(), sf)
         };
         if ret == 0 {
+            unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), addr) };
             do_call_targets.push(addr);
             output_message(&format!(
                 "[artController] Layer 2: DoCall[{}] hook 安装成功: {:#x}",
@@ -425,13 +449,12 @@ pub(super) fn ensure_art_controller_initialized(
 
     // Fix 3: hook CopyingPhase/MarkingPhase on_leave
     if bridge.gc_copying_phase != 0 {
+        let (ha, sf) = unsafe { prepare_hook_target(bridge.gc_copying_phase, std::ptr::null_mut()) }.unwrap_or((bridge.gc_copying_phase, 0));
         let ret = unsafe {
-            {
-                let (ha, sf) = prepare_hook_target(bridge.gc_copying_phase, std::ptr::null_mut()).unwrap_or((bridge.gc_copying_phase, 0));
-                hook_ffi::hook_attach(ha as *mut std::ffi::c_void, None, Some(on_gc_sync_leave), std::ptr::null_mut(), sf)
-            }
+            hook_ffi::hook_attach(ha as *mut std::ffi::c_void, None, Some(on_gc_sync_leave), std::ptr::null_mut(), sf)
         };
         if ret == 0 {
+            unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), bridge.gc_copying_phase) };
             gc_hook_targets.push(bridge.gc_copying_phase);
             output_message(&format!(
                 "[artController] GC CopyingPhase hook 安装成功: {:#x}",
@@ -447,13 +470,12 @@ pub(super) fn ensure_art_controller_initialized(
 
     // Fix 3: hook CollectGarbageInternal on_leave (主 GC 入口)
     if bridge.gc_collect_internal != 0 {
+        let (ha, sf) = unsafe { prepare_hook_target(bridge.gc_collect_internal, std::ptr::null_mut()) }.unwrap_or((bridge.gc_collect_internal, 0));
         let ret = unsafe {
-            {
-                let (ha, sf) = prepare_hook_target(bridge.gc_collect_internal, std::ptr::null_mut()).unwrap_or((bridge.gc_collect_internal, 0));
-                hook_ffi::hook_attach(ha as *mut std::ffi::c_void, None, Some(on_gc_sync_leave), std::ptr::null_mut(), sf)
-            }
+            hook_ffi::hook_attach(ha as *mut std::ffi::c_void, None, Some(on_gc_sync_leave), std::ptr::null_mut(), sf)
         };
         if ret == 0 {
+            unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), bridge.gc_collect_internal) };
             gc_hook_targets.push(bridge.gc_collect_internal);
             output_message(&format!(
                 "[artController] GC CollectGarbageInternal hook 安装成功: {:#x}",
@@ -469,13 +491,12 @@ pub(super) fn ensure_art_controller_initialized(
 
     // Fix 3: hook RunFlipFunction on_enter (线程翻转期间同步)
     if bridge.run_flip_function != 0 {
+        let (ha, sf) = unsafe { prepare_hook_target(bridge.run_flip_function, std::ptr::null_mut()) }.unwrap_or((bridge.run_flip_function, 0));
         let ret = unsafe {
-            {
-                let (ha, sf) = prepare_hook_target(bridge.run_flip_function, std::ptr::null_mut()).unwrap_or((bridge.run_flip_function, 0));
-                hook_ffi::hook_attach(ha as *mut std::ffi::c_void, Some(on_gc_sync_enter), None, std::ptr::null_mut(), sf)
-            }
+            hook_ffi::hook_attach(ha as *mut std::ffi::c_void, Some(on_gc_sync_enter), None, std::ptr::null_mut(), sf)
         };
         if ret == 0 {
+            unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), bridge.run_flip_function) };
             gc_hook_targets.push(bridge.run_flip_function);
             output_message(&format!(
                 "[artController] GC RunFlipFunction hook 安装成功: {:#x}",
@@ -493,13 +514,12 @@ pub(super) fn ensure_art_controller_initialized(
     // 对 replacement method 返回 NULL，防止 ART 查找堆分配方法的 OAT 代码头
     let mut oat_header_hook_target: u64 = 0;
     if bridge.get_oat_quick_method_header != 0 {
+        let (ha, sf) = unsafe { prepare_hook_target(bridge.get_oat_quick_method_header, std::ptr::null_mut()) }.unwrap_or((bridge.get_oat_quick_method_header, 0));
         let trampoline = unsafe {
-            {
-                let (ha, sf) = prepare_hook_target(bridge.get_oat_quick_method_header, std::ptr::null_mut()).unwrap_or((bridge.get_oat_quick_method_header, 0));
-                hook_ffi::hook_replace(ha as *mut std::ffi::c_void, Some(on_get_oat_quick_method_header), std::ptr::null_mut(), sf)
-            }
+            hook_ffi::hook_replace(ha as *mut std::ffi::c_void, Some(on_get_oat_quick_method_header), std::ptr::null_mut(), sf)
         };
         if !trampoline.is_null() {
+            unsafe { try_fixup_trampoline(trampoline, bridge.get_oat_quick_method_header) };
             oat_header_hook_target = bridge.get_oat_quick_method_header;
             output_message(&format!(
                 "[artController] GetOatQuickMethodHeader hook 安装成功: {:#x}, trampoline={:#x}",
@@ -517,13 +537,12 @@ pub(super) fn ensure_art_controller_initialized(
     // 类初始化完成后同步 replacement 方法，防止 quickCode 被更新绕过 hook
     let mut fixup_hook_target: u64 = 0;
     if bridge.fixup_static_trampolines != 0 {
+        let (ha, sf) = unsafe { prepare_hook_target(bridge.fixup_static_trampolines, std::ptr::null_mut()) }.unwrap_or((bridge.fixup_static_trampolines, 0));
         let ret = unsafe {
-            {
-                let (ha, sf) = prepare_hook_target(bridge.fixup_static_trampolines, std::ptr::null_mut()).unwrap_or((bridge.fixup_static_trampolines, 0));
-                hook_ffi::hook_attach(ha as *mut std::ffi::c_void, None, Some(on_gc_sync_leave), std::ptr::null_mut(), sf)
-            }
+            hook_ffi::hook_attach(ha as *mut std::ffi::c_void, None, Some(on_gc_sync_leave), std::ptr::null_mut(), sf)
         };
         if ret == 0 {
+            unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), bridge.fixup_static_trampolines) };
             fixup_hook_target = bridge.fixup_static_trampolines;
             output_message(&format!(
                 "[artController] FixupStaticTrampolines hook 安装成功: {:#x}",
@@ -540,13 +559,12 @@ pub(super) fn ensure_art_controller_initialized(
     // --- Fix: hook PrettyMethod (NULL 指针崩溃防护) ---
     let mut pretty_method_hook_target: u64 = 0;
     if bridge.pretty_method != 0 {
+        let (ha, sf) = unsafe { prepare_hook_target(bridge.pretty_method, std::ptr::null_mut()) }.unwrap_or((bridge.pretty_method, 0));
         let ret = unsafe {
-            {
-                let (ha, sf) = prepare_hook_target(bridge.pretty_method, std::ptr::null_mut()).unwrap_or((bridge.pretty_method, 0));
-                hook_ffi::hook_attach(ha as *mut std::ffi::c_void, Some(on_pretty_method_enter), None, std::ptr::null_mut(), sf)
-            }
+            hook_ffi::hook_attach(ha as *mut std::ffi::c_void, Some(on_pretty_method_enter), None, std::ptr::null_mut(), sf)
         };
         if ret == 0 {
+            unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), bridge.pretty_method) };
             pretty_method_hook_target = bridge.pretty_method;
             output_message(&format!(
                 "[artController] PrettyMethod hook 安装成功: {:#x}",

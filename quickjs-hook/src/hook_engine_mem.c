@@ -559,6 +559,25 @@ static int pool_in_range(ExecPool* pool, void* target, int64_t range) {
 }
 
 
+int hook_rebuild_trampoline(void* trampoline, size_t trampoline_size,
+                            const void* orig_bytes, uint64_t orig_pc,
+                            void* jump_back_target) {
+    if (!trampoline || !orig_bytes || !jump_back_target) return -1;
+
+    uint32_t written_regs = 0;
+    size_t relocated_size = hook_relocate_instructions(
+        orig_bytes, orig_pc, trampoline, 4, &written_regs);
+
+    int jump_len = write_jump_back(
+        (uint8_t*)trampoline + relocated_size,
+        jump_back_target, written_regs);
+    if (jump_len < 0) return jump_len;
+
+    size_t total = relocated_size + (size_t)jump_len;
+    hook_flush_cache(trampoline, total);
+    return (int)total;
+}
+
 int hook_register_pool(void* base, size_t size) {
     if (!g_engine.initialized || !base || size == 0) return -1;
     if (g_engine.pool_count >= MAX_EXEC_POOLS) {
