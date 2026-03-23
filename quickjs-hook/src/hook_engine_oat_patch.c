@@ -343,8 +343,8 @@ static void* generate_oat_inline_trampoline(
     }
     arm64_writer_put_b_cond_label(&w, ARM64_COND_EQ, lbl_runtime_or_replacement);
 
-    /* --- Step 3: Save caller-saved registers + LR --- */
-    /* Stack frame layout (total 224 bytes, 16-byte aligned):
+    /* --- Step 3: Save caller-saved registers --- */
+    /* Stack frame layout (total 208 bytes, 16-byte aligned):
      *   [SP + 0]    x0, x1
      *   [SP + 16]   x2, x3
      *   [SP + 32]   x4, x5
@@ -354,18 +354,17 @@ static void* generate_oat_inline_trampoline(
      *   [SP + 96]   x12, x13
      *   [SP + 112]  x14, x15
      *   [SP + 128]  x16, x17
-     *   [SP + 144]  x30 (LR), padding
-     *   [SP + 160]  d0, d1
-     *   [SP + 176]  d2, d3
-     *   [SP + 192]  d4, d5
-     *   [SP + 208]  d6, d7
+     *   [SP + 144]  d0, d1
+     *   [SP + 160]  d2, d3
+     *   [SP + 176]  d4, d5
+     *   [SP + 192]  d6, d7
      *
-     * X30 必须保存: BLR is_replacement_in_table 会破坏 LR，
-     * 而包含 OAT patch 的 libart.so 函数可能在 prologue 之后
-     * 把 X30 当通用寄存器使用 (clang 常见优化)。
+     * X30 不保存: 对标 Frida (也不保存 X30)。
+     * OAT inline patch 点在大函数内部，函数 prologue 已 STP X29,X30。
+     * BLR 破坏 X30 后，函数 epilogue 从栈帧恢复。
      */
     #undef OAT_SAVE_FRAME_SIZE
-    #define OAT_SAVE_FRAME_SIZE 224
+    #define OAT_SAVE_FRAME_SIZE 208
     arm64_writer_put_sub_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, OAT_SAVE_FRAME_SIZE);
     /* x0-x17 */
     arm64_writer_put_stp_reg_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_X1,
@@ -386,13 +385,11 @@ static void* generate_oat_inline_trampoline(
         ARM64_REG_SP, 112, ARM64_INDEX_SIGNED_OFFSET);
     arm64_writer_put_stp_reg_reg_reg_offset(&w, ARM64_REG_X16, ARM64_REG_X17,
         ARM64_REG_SP, 128, ARM64_INDEX_SIGNED_OFFSET);
-    /* x30 (LR) — BLR 会破坏它 */
-    arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 144);
     /* d0-d7 */
-    arm64_writer_put_fp_stp_offset(&w, 0, 1, ARM64_REG_SP, 160);
-    arm64_writer_put_fp_stp_offset(&w, 2, 3, ARM64_REG_SP, 176);
-    arm64_writer_put_fp_stp_offset(&w, 4, 5, ARM64_REG_SP, 192);
-    arm64_writer_put_fp_stp_offset(&w, 6, 7, ARM64_REG_SP, 208);
+    arm64_writer_put_fp_stp_offset(&w, 0, 1, ARM64_REG_SP, 144);
+    arm64_writer_put_fp_stp_offset(&w, 2, 3, ARM64_REG_SP, 160);
+    arm64_writer_put_fp_stp_offset(&w, 4, 5, ARM64_REG_SP, 176);
+    arm64_writer_put_fp_stp_offset(&w, 6, 7, ARM64_REG_SP, 192);
 
     /* --- Step 4: Call is_replacement_in_table(method) --- */
     /* MOV X0, Xmethod */
@@ -404,14 +401,12 @@ static void* generate_oat_inline_trampoline(
     /* --- Step 5: CMP X0, XZR --- */
     arm64_writer_put_cmp_reg_reg(&w, ARM64_REG_X0, ARM64_REG_XZR);
 
-    /* --- Step 6: Restore registers + LR --- */
+    /* --- Step 6: Restore registers --- */
     /* d0-d7 */
-    arm64_writer_put_fp_ldp_offset(&w, 0, 1, ARM64_REG_SP, 160);
-    arm64_writer_put_fp_ldp_offset(&w, 2, 3, ARM64_REG_SP, 176);
-    arm64_writer_put_fp_ldp_offset(&w, 4, 5, ARM64_REG_SP, 192);
-    arm64_writer_put_fp_ldp_offset(&w, 6, 7, ARM64_REG_SP, 208);
-    /* x30 (LR) — 恢复被 BLR 破坏的值 */
-    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 144);
+    arm64_writer_put_fp_ldp_offset(&w, 0, 1, ARM64_REG_SP, 144);
+    arm64_writer_put_fp_ldp_offset(&w, 2, 3, ARM64_REG_SP, 160);
+    arm64_writer_put_fp_ldp_offset(&w, 4, 5, ARM64_REG_SP, 176);
+    arm64_writer_put_fp_ldp_offset(&w, 6, 7, ARM64_REG_SP, 192);
     /* x0-x17 */
     arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_X1,
         ARM64_REG_SP, 0, ARM64_INDEX_SIGNED_OFFSET);
