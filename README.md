@@ -147,16 +147,34 @@ type JNINativeMethodInfo = {
 ## Native Hook
 
 ```js
-// 基本 hook（必须 return ctx.orig()，不 return 则 x0 置 0）
+// 基本 hook — 透传
 hook(Module.findExportByName("libc.so", "open"), function(ctx) {
     console.log("open:", Memory.readCString(ptr(ctx.x0)));
     return ctx.orig();
 });
 
-// 修改返回值（通过 return）
+// 修改返回值
 hook(Module.findExportByName("libc.so", "getpid"), function(ctx) {
     ctx.orig();
-    return 12345;
+    return 12345;              // 调用方拿到 12345
+});
+
+// 修改参数 — 通过 ctx 属性
+hook(target, function(ctx) {
+    ctx.x0 = ptr("0x1234");   // 改第一个参数
+    ctx.x1 = 100;             // 改第二个参数
+    return ctx.orig();         // 用修改后的参数调原函数
+});
+
+// 修改参数 — 通过 orig() 传参（按顺序覆盖 x0-xN）
+hook(target, function(ctx) {
+    return ctx.orig(ptr("0x1234"), 100);
+});
+
+// 不 return 也行 — ctx.x0 赋值会同步回 C 层
+hook(Module.findExportByName("libc.so", "getuid"), function(ctx) {
+    ctx.orig();
+    ctx.x0 = 77777;           // 调用方拿到 77777
 });
 
 // 移除 hook
@@ -430,9 +448,9 @@ Trace 文件默认输出到 `/data/data/<package>/trace_bundle.pb`，配合 qbdi
 
 ## 注意事项
 
-- **两种 hook 都必须 `return ctx.orig()`**，不 return 则返回值丢失（Native x0 置 0，Java 返回 null/0）
-- **改返回值统一用 `return`：** `return ctx.orig()` 透传，`return 12345` 覆盖
-- `ctx.x0` 等寄存器属性是只读快照，赋值不影响实际寄存器和返回值
+- **两种 hook 都建议 `return ctx.orig()`** 透传返回值
+- **Native hook 改参数/返回值：** `ctx.x0 = value` 或 `ctx.orig(newArg0, newArg1)`，`return value` 覆盖返回值
+- **Java hook 改参数/返回值：** `return ctx.orig(newArgs)` 改参数，`return value` 改返回值
 - Spawn 模式下 Java hook 必须放在 `Java.ready(fn)` 里
 - `Java.setStealth()` 必须在 `Java.use().impl` 之前调用
 - `callNative()` 仅支持整数/指针参数（最多 6 个）
