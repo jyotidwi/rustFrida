@@ -30,7 +30,6 @@ pub(crate) fn dump_props(profile_name: &str) -> Result<(), String> {
 
     log_step!("Dump 属性到 profile: {}", profile_name);
 
-    // 创建 profile 目录
     std::fs::create_dir_all(&profile_dir)
         .map_err(|e| format!("创建目录 {} 失败: {}", profile_dir, e))?;
 
@@ -45,108 +44,173 @@ pub(crate) fn dump_props(profile_name: &str) -> Result<(), String> {
         if !src.is_file() {
             continue;
         }
-
-        let filename = entry.file_name();
-        let dst = format!("{}/{}", profile_dir, filename.to_string_lossy());
-
+        let dst = format!("{}/{}", profile_dir, entry.file_name().to_string_lossy());
         std::fs::copy(&src, &dst)
             .map_err(|e| format!("复制 {:?} → {} 失败: {}", src, dst, e))?;
         count += 1;
     }
     log_info!("已复制 {} 个属性区域文件", count);
 
-    // Dump getprop 输出（人类可读参考）
+    // Dump getprop 输出（参考）
     let output = std::process::Command::new("getprop")
         .output()
         .map_err(|e| format!("执行 getprop 失败: {}", e))?;
-
-    let props_path = format!("{}/props.txt", profile_dir);
-    std::fs::write(&props_path, &output.stdout)
-        .map_err(|e| format!("写入 {} 失败: {}", props_path, e))?;
-
-    // 创建 override.prop 模板（仅首次）
-    let override_path = format!("{}/override.prop", profile_dir);
-    if !std::path::Path::new(&override_path).exists() {
-        let template = "\
-# 属性覆盖文件 — 每行格式: key=value
-# 注释行以 # 开头，空行忽略
-#
-# 示例:
-# ro.build.fingerprint=google/oriole/oriole:12/SQ3A.220705.003.A1/8672226:user/release-keys
-# ro.build.display.id=SQ3A.220705.003.A1
-# ro.debuggable=0
-# ro.secure=1
-# ro.build.tags=release-keys
-# ro.build.type=user
-";
-        std::fs::write(&override_path, template)
-            .map_err(|e| format!("写入 {} 失败: {}", override_path, e))?;
-    }
+    std::fs::write(format!("{}/props.txt", profile_dir), &output.stdout)
+        .map_err(|e| format!("写入 props.txt 失败: {}", e))?;
 
     log_success!("Profile '{}' 已保存到 {}", profile_name, profile_dir);
-    log_info!("  props.txt      — getprop 完整输出 (参考)");
-    log_info!("  override.prop  — 编辑此文件定义属性覆盖");
-    log_info!("  其他文件       — 原始属性区域二进制文件");
-    log_info!("");
-    log_info!(
-        "使用方法: rustfrida --spawn <package> --profile {}",
-        profile_name
-    );
+    log_info!("  用 --set-prop {} <key=value> 修改属性", profile_name);
+    log_info!("  用 --spawn <pkg> --profile {} 应用", profile_name);
 
     Ok(())
 }
 
-/// 列出已有 profile
-#[allow(dead_code)]
-pub(crate) fn list_profiles() -> Vec<String> {
-    let mut profiles = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(PROP_PROFILES_DIR) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    profiles.push(name.to_string());
-                }
-            }
-        }
+/// 修改 profile 中的属性值（类似 resetprop）
+pub(crate) fn set_prop(profile_name: &str, key_value: &str) -> Result<(), String> {
+    let profile_dir = format!("{}/{}", PROP_PROFILES_DIR, profile_name);
+
+    if !std::path::Path::new(&profile_dir).exists() {
+        return Err(format!(
+            "Profile '{}' 不存在，先运行: rustfrida --dump-props {}",
+            profile_name, profile_name
+        ));
     }
-    profiles
+
+    let (key, value) = key_value.split_once('=').ok_or_else(|| {
+        format!("格式错误，应为 key=value: {}", key_value)
+    })?;
+    let key = key.trim();
+    let value = value.trim();
+
+    if key.is_empty() {
+        return Err("属性名不能为空".to_string());
+    }
+    if value.len() >= PROP_VALUE_MAX {
+        return Err(format!("属性值超过 {} 字节限制", PROP_VALUE_MAX - 1));
+    }
+
+    let mut overrides = HashMap::new();
+    overrides.insert(key.to_string(), value.to_string());
+
+    let count = patch_prop_files(&profile_dir, &overrides)?;
+    if count == 0 {
+        return Err(format!("未在属性文件中找到: {}", key));
+    }
+
+    log_success!("{} = {}", key, value);
+    Ok(())
 }
 
-/// 预处理属性 profile：patch 文件 + 返回 profile 目录路径
+/// 删除 profile 中的属性（清零 value + serial）
+pub(crate) fn del_prop(profile_name: &str, key: &str) -> Result<(), String> {
+    let profile_dir = format!("{}/{}", PROP_PROFILES_DIR, profile_name);
+
+    if !std::path::Path::new(&profile_dir).exists() {
+        return Err(format!(
+            "Profile '{}' 不存在，先运行: rustfrida --dump-props {}",
+            profile_name, profile_name
+        ));
+    }
+
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("属性名不能为空".to_string());
+    }
+
+    let mut overrides = HashMap::new();
+    overrides.insert(key.to_string(), String::new());
+
+    let count = patch_prop_files(&profile_dir, &overrides)?;
+    if count == 0 {
+        return Err(format!("未在属性文件中找到: {}", key));
+    }
+
+    log_success!("已删除: {}", key);
+    Ok(())
+}
+
+/// 重排 profile：解析当前二进制文件，过滤空属性，重建紧凑文件
+pub(crate) fn repack_props(profile_name: &str) -> Result<(), String> {
+    let profile_dir = format!("{}/{}", PROP_PROFILES_DIR, profile_name);
+
+    if !std::path::Path::new(&profile_dir).exists() {
+        return Err(format!("Profile '{}' 不存在", profile_name));
+    }
+
+    let entries = std::fs::read_dir(&profile_dir)
+        .map_err(|e| format!("读取 {} 失败: {}", profile_dir, e))?;
+
+    let mut total_before = 0usize;
+    let mut total_after = 0usize;
+    let mut files_repacked = 0u32;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let filename = entry.file_name().to_string_lossy().to_string();
+        if matches!(filename.as_str(), "props.txt" | "properties_serial" | ".active") {
+            continue;
+        }
+
+        let data = std::fs::read(&path)
+            .map_err(|e| format!("读取 {:?} 失败: {}", path, e))?;
+
+        if data.len() < PROP_AREA_HEADER_SIZE {
+            continue;
+        }
+        let magic = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        if magic != PROP_AREA_MAGIC {
+            continue;
+        }
+
+        // 解析所有属性
+        let props = parse_prop_area(&data);
+        // 过滤空值（已删除的属性）
+        let active: Vec<_> = props.iter()
+            .filter(|(_, v)| !v.is_empty())
+            .cloned()
+            .collect();
+
+        if active.len() < props.len() || has_long_prop_holes(&data) {
+            let new_data = build_prop_area(&active);
+            total_before += data.len();
+            total_after += new_data.len();
+            std::fs::write(&path, &new_data)
+                .map_err(|e| format!("写回 {:?} 失败: {}", path, e))?;
+            files_repacked += 1;
+            log_verbose!(
+                "重排 {}: {} 条属性, {} → {} bytes",
+                filename, active.len(), data.len(), new_data.len()
+            );
+        }
+    }
+
+    if files_repacked == 0 {
+        log_info!("无需重排（没有空洞）");
+    } else {
+        log_success!(
+            "已重排 {} 个文件 ({} → {} bytes)",
+            files_repacked, total_before, total_after
+        );
+    }
+    Ok(())
+}
+
+/// 激活属性 profile：写 .active 文件，返回 profile 目录路径
 ///
-/// 在 spawn_and_inject 之前调用。patch 完成后，zymbiote 在 fork 的子进程中
-/// 自动 mount bind + remap，无需 ptrace。
+/// 在 spawn_and_inject 之前调用。zymbiote 在 fork 的子进程中
+/// 读取 .active 自动 mount bind + remap。
 pub(crate) fn prep_prop_profile(profile_name: &str) -> Result<String, String> {
     let profile_dir = format!("{}/{}", PROP_PROFILES_DIR, profile_name);
 
     if !std::path::Path::new(&profile_dir).exists() {
         return Err(format!(
-            "Profile '{}' 不存在 (路径: {})\n  先运行: rustfrida --dump-props {}",
-            profile_name, profile_dir, profile_name
+            "Profile '{}' 不存在，先运行: rustfrida --dump-props {}",
+            profile_name, profile_name
         ));
-    }
-
-    log_step!("预处理属性 profile: {}", profile_name);
-
-    // 读取 override.prop
-    let override_path = format!("{}/override.prop", profile_dir);
-    let overrides = if std::path::Path::new(&override_path).exists() {
-        parse_override_file(&override_path)?
-    } else {
-        HashMap::new()
-    };
-
-    if overrides.is_empty() {
-        log_info!("override.prop 为空，使用 dump 时的属性快照");
-    } else {
-        log_info!("属性覆盖 ({} 条):", overrides.len());
-        for (k, v) in &overrides {
-            println!("     {} = {}", k, v);
-        }
-
-        // 修补 profile 中的属性文件
-        let count = patch_prop_files(&profile_dir, &overrides)?;
-        log_success!("已修补 {} 个属性文件", count);
     }
 
     // 写 .active 文件：zymbiote 读取此文件获取 profile 目录路径
@@ -154,55 +218,11 @@ pub(crate) fn prep_prop_profile(profile_name: &str) -> Result<String, String> {
     std::fs::write(&active_path, format!("{}\n", profile_dir))
         .map_err(|e| format!("写入 {} 失败: {}", active_path, e))?;
 
-    log_info!(
-        "Profile '{}' 已就绪，zymbiote 将在子进程 fork 后自动 mount+remap",
-        profile_name
-    );
-
+    log_info!("属性 profile '{}' 已激活", profile_name);
     Ok(profile_dir)
 }
 
 // ─── 内部实现 ────────────────────────────────────────────────────────────────
-
-/// 解析 override.prop 文件 → HashMap<key, value>
-fn parse_override_file(path: &str) -> Result<HashMap<String, String>, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("读取 {} 失败: {}", path, e))?;
-
-    let mut overrides = HashMap::new();
-    for (lineno, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            if key.is_empty() {
-                log_warn!("override.prop:{}: 空 key，跳过", lineno + 1);
-                continue;
-            }
-            if value.len() >= PROP_VALUE_MAX {
-                log_warn!(
-                    "override.prop:{}: 值超过 {} 字节限制: {}",
-                    lineno + 1,
-                    PROP_VALUE_MAX - 1,
-                    key
-                );
-                continue;
-            }
-            overrides.insert(key.to_string(), value.to_string());
-        } else {
-            log_warn!(
-                "override.prop:{}: 格式错误 (应为 key=value): {}",
-                lineno + 1,
-                line
-            );
-        }
-    }
-
-    Ok(overrides)
-}
 
 /// 修补 profile 中的属性区域文件
 ///
@@ -282,7 +302,7 @@ fn patch_prop_files(
                 let serial_offset = value_offset - 4;
 
                 // 读取 serial 判断是否为 long property
-                let serial = u32::from_le_bytes(
+                let _serial = u32::from_le_bytes(
                     data[serial_offset..serial_offset + 4].try_into().unwrap(),
                 );
                 // long property 标记: value 区域包含 "Must use __system_property_read_callback"
@@ -360,4 +380,246 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+// ─── prop_area 解析与重建 ────────────────────────────────────────────────────
+
+/// 从 prop_area 二进制数据中提取所有 (key, value) 对
+/// 遍历 trie 结构，收集所有 prop_info 条目
+fn parse_prop_area(data: &[u8]) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    if data.len() < PROP_AREA_HEADER_SIZE {
+        return result;
+    }
+
+    let data_section = &data[PROP_AREA_HEADER_SIZE..];
+
+    // 遍历 trie: prop_bt 从 offset 0 开始
+    if !data_section.is_empty() {
+        walk_trie(data_section, 0, &mut String::new(), &mut result);
+    }
+    result
+}
+
+/// 递归遍历 prop_bt trie 节点
+/// prop_bt: namelen(4) + prop(4) + left(4) + right(4) + children(4) + name(namelen)
+fn walk_trie(data: &[u8], offset: usize, prefix: &mut String, result: &mut Vec<(String, String)>) {
+    if offset + 20 > data.len() {
+        return;
+    }
+
+    let namelen = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    let prop_off = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+    let left = u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()) as usize;
+    let right = u32::from_le_bytes(data[offset + 12..offset + 16].try_into().unwrap()) as usize;
+    let children = u32::from_le_bytes(data[offset + 16..offset + 20].try_into().unwrap()) as usize;
+
+    // 左子树
+    if left != 0 {
+        walk_trie(data, left, prefix, result);
+    }
+
+    // 当前节点
+    let name_start = offset + 20;
+    if name_start + namelen <= data.len() {
+        let saved_len = prefix.len();
+
+        if namelen > 0 {
+            let name_frag = String::from_utf8_lossy(&data[name_start..name_start + namelen]).to_string();
+            if !prefix.is_empty() {
+                prefix.push('.');
+            }
+            prefix.push_str(&name_frag);
+        }
+
+        // 如果有 prop_info
+        if prop_off != 0 {
+            if let Some((key, value)) = read_prop_info(data, prop_off) {
+                result.push((key, value));
+            }
+        }
+
+        // children 子树（root 节点 namelen=0 也要递归 children）
+        if children != 0 {
+            walk_trie(data, children, prefix, result);
+        }
+
+        prefix.truncate(saved_len);
+    }
+
+    // 右子树
+    if right != 0 {
+        walk_trie(data, right, prefix, result);
+    }
+}
+
+/// 从 prop_info 读取 (name, value)
+/// prop_info: serial(4) + value(92) + name(null-terminated)
+fn read_prop_info(data: &[u8], offset: usize) -> Option<(String, String)> {
+    if offset + 4 + PROP_VALUE_MAX > data.len() {
+        return None;
+    }
+
+    let value_start = offset + 4;
+    let name_start = value_start + PROP_VALUE_MAX;
+
+    // 读 name
+    let name_end = data[name_start..].iter().position(|&b| b == 0)?;
+    let name = String::from_utf8_lossy(&data[name_start..name_start + name_end]).to_string();
+
+    // 检测 long property
+    let is_long = data[value_start..value_start + 10]
+        .starts_with(b"Must use _");
+
+    let value = if is_long {
+        // long property: 实际值在 name\0 之后（4字节对齐）
+        let long_start = name_start + name_end + 1;
+        let long_start = (long_start + 3) & !3;
+        if long_start < data.len() {
+            let end = data[long_start..].iter().position(|&b| b == 0).unwrap_or(0);
+            String::from_utf8_lossy(&data[long_start..long_start + end]).to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        let end = data[value_start..value_start + PROP_VALUE_MAX]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(PROP_VALUE_MAX);
+        String::from_utf8_lossy(&data[value_start..value_start + end]).to_string()
+    };
+
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, value))
+}
+
+/// 检测文件是否有 long property 空洞
+fn has_long_prop_holes(data: &[u8]) -> bool {
+    // 如果文件中包含 "Must use __system_property" 占位符，说明有 long prop（可能已被改短）
+    find_bytes(data, b"Must use _").is_some()
+}
+
+/// 从 (key, value) 列表构建 prop_area 二进制数据
+fn build_prop_area(props: &[(String, String)]) -> Vec<u8> {
+    let area_size = 128 * 1024;
+    let mut data = vec![0u8; area_size];
+    let data_start = PROP_AREA_HEADER_SIZE;
+
+    // Header
+    data[8..12].copy_from_slice(&PROP_AREA_MAGIC.to_le_bytes());
+    data[12..16].copy_from_slice(&0xfc6ed0abu32.to_le_bytes());
+
+    // Bump allocator
+    let mut alloc_pos = 0usize;
+    let data_cap = area_size - data_start;
+
+    let mut bump = |size: usize| -> Option<usize> {
+        let aligned = (alloc_pos + 3) & !3;
+        if aligned + size > data_cap { return None; }
+        alloc_pos = aligned + size;
+        Some(aligned)
+    };
+
+    // 根哨兵节点 (namelen=0, 只有 children 指针有意义)
+    let root_off = bump(20).unwrap(); // offset 0, 20 bytes (namelen=0, no name data)
+    // root node: all zeros = namelen=0, prop=0, left=0, right=0, children=0
+
+    // 辅助: 在 data section 中读/写 u32
+    let read_u32 = |data: &[u8], off: usize| -> u32 {
+        u32::from_le_bytes(data[data_start + off..data_start + off + 4].try_into().unwrap())
+    };
+
+    // 插入每个属性到 trie
+    for (name, value) in props {
+        let parts: Vec<&str> = name.split('.').collect();
+        // 从根节点开始，逐级找/建 trie 节点
+        let mut parent_children_ptr_off = root_off + 16; // root.children 在 root_off+16
+
+        for (depth, part) in parts.iter().enumerate() {
+            let is_leaf = depth == parts.len() - 1;
+
+            // 在当前层的 BST 中查找或插入
+            let mut cur_ptr_off = parent_children_ptr_off;
+            loop {
+                let cur = read_u32(&data, cur_ptr_off);
+                if cur == 0 {
+                    // 空位，创建新节点
+                    let namelen = part.len();
+                    let node_off = match bump(20 + namelen) {
+                        Some(o) => o,
+                        None => break,
+                    };
+                    data[data_start + node_off..data_start + node_off + 4]
+                        .copy_from_slice(&(namelen as u32).to_le_bytes());
+                    data[data_start + node_off + 20..data_start + node_off + 20 + namelen]
+                        .copy_from_slice(part.as_bytes());
+                    // 写指针
+                    data[data_start + cur_ptr_off..data_start + cur_ptr_off + 4]
+                        .copy_from_slice(&(node_off as u32).to_le_bytes());
+
+                    if is_leaf {
+                        // 分配 prop_info
+                        let nbytes = name.as_bytes();
+                        if let Some(pi_off) = bump(4 + PROP_VALUE_MAX + nbytes.len() + 1) {
+                            data[data_start + pi_off..data_start + pi_off + 4]
+                                .copy_from_slice(&2u32.to_le_bytes()); // serial=2
+                            let vb = value.as_bytes();
+                            let vlen = vb.len().min(PROP_VALUE_MAX - 1);
+                            data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen]
+                                .copy_from_slice(&vb[..vlen]);
+                            let noff = pi_off + 4 + PROP_VALUE_MAX;
+                            data[data_start + noff..data_start + noff + nbytes.len()]
+                                .copy_from_slice(nbytes);
+                            // prop 指针
+                            data[data_start + node_off + 4..data_start + node_off + 8]
+                                .copy_from_slice(&(pi_off as u32).to_le_bytes());
+                        }
+                    }
+                    parent_children_ptr_off = node_off + 16; // children
+                    break;
+                } else {
+                    // 节点存在，比较
+                    let cur_off = cur as usize;
+                    let nl = read_u32(&data, cur_off) as usize;
+                    let cur_name = &data[data_start + cur_off + 20..data_start + cur_off + 20 + nl];
+
+                    match part.as_bytes().cmp(cur_name) {
+                        std::cmp::Ordering::Less => cur_ptr_off = cur_off + 8,   // left
+                        std::cmp::Ordering::Greater => cur_ptr_off = cur_off + 12, // right
+                        std::cmp::Ordering::Equal => {
+                            if is_leaf {
+                                // 更新已有节点的 prop_info
+                                let nbytes = name.as_bytes();
+                                if let Some(pi_off) = bump(4 + PROP_VALUE_MAX + nbytes.len() + 1) {
+                                    data[data_start + pi_off..data_start + pi_off + 4]
+                                        .copy_from_slice(&2u32.to_le_bytes());
+                                    let vb = value.as_bytes();
+                                    let vlen = vb.len().min(PROP_VALUE_MAX - 1);
+                                    data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen]
+                                        .copy_from_slice(&vb[..vlen]);
+                                    let noff = pi_off + 4 + PROP_VALUE_MAX;
+                                    data[data_start + noff..data_start + noff + nbytes.len()]
+                                        .copy_from_slice(nbytes);
+                                    data[data_start + cur_off + 4..data_start + cur_off + 8]
+                                        .copy_from_slice(&(pi_off as u32).to_le_bytes());
+                                }
+                            }
+                            parent_children_ptr_off = cur_off + 16; // children
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // bytes_used
+    data[0..4].copy_from_slice(&(alloc_pos as u32).to_le_bytes());
+
+    // 截断到实际使用大小（对齐到页）
+    let used = data_start + ((alloc_pos + 4095) & !4095);
+    data.truncate(used.min(area_size));
+    data
 }

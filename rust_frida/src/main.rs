@@ -49,6 +49,39 @@ fn main() {
         }
     }
 
+    // --set-prop: 独立操作，修改属性后退出
+    if let Some(ref set_args) = args.set_prop {
+        match props::set_prop(&set_args[0], &set_args[1]) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                log_error!("设置属性失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // --del-prop: 独立操作，删除属性后退出
+    if let Some(ref del_args) = args.del_prop {
+        match props::del_prop(&del_args[0], &del_args[1]) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                log_error!("删除属性失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // --repack-props: 独立操作，重排后退出
+    if let Some(ref profile_name) = args.repack_props {
+        match props::repack_props(profile_name) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                log_error!("重排失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // 解析 --name 到 PID（如果指定）
     let resolved_pid: Option<i32> = if let Some(ref name) = args.name {
         match find_pid_by_name(name) {

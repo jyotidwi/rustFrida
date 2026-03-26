@@ -28,11 +28,13 @@ inline hook、Frida Stalker 追踪等功能。
   rustfrida --pid 1234 --verbose               # 显示详细注入调试信息
 
 属性伪装:
-  rustfrida --dump-props default               # Dump 本机属性到 profile
-  rustfrida --spawn com.app --profile default  # Spawn 并覆盖属性
+  rustfrida --dump-props default                                    # Dump 属性快照
+  rustfrida --set-prop default ro.build.fingerprint=google/...      # 修改属性值
+  rustfrida --set-prop default ro.debuggable=0                      # 可多次调用
+  rustfrida --spawn com.app --profile default                       # Spawn 并应用
 
 注入后进入 REPL，输入 help 查看可用命令（jsinit / loadjs / jsrepl / jhook 等）。",
-    group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name", "spawn", "dump_props"]))
+    group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name", "spawn", "dump_props", "set_prop", "del_prop", "repack_props"]))
 )]
 pub(crate) struct Args {
     /// 目标进程的PID（与 --watch-so、--name、--spawn 互斥）
@@ -86,19 +88,49 @@ pub(crate) struct Args {
 
     /// Dump 本机属性到 profile（独立操作，不注入进程）
     ///
-    /// 将 /dev/__properties__/ 和 getprop 输出保存到 /dev/properties/.profiles/<PROFILE>/，
-    /// 编辑 override.prop 定义属性覆盖，再用 --spawn --profile 应用。
+    /// 复制 /dev/__properties__/ 二进制文件到 profile 目录，
+    /// 之后用 --set-prop 修改单个属性值。
     #[arg(
         long = "dump-props",
         value_name = "PROFILE",
-        conflicts_with_all = ["pid", "watch_so", "name", "spawn"]
+        conflicts_with_all = ["pid", "watch_so", "name", "spawn", "set_prop"]
     )]
     pub(crate) dump_props: Option<String>,
 
-    /// 指定属性覆盖 profile（仅 --spawn 模式可用）
+    /// 修改 profile 中的属性值（类似 magisk resetprop）
     ///
-    /// 在子进程恢复前 bind mount 修改后的属性文件到 /dev/__properties__/，
-    /// 同时重写已映射内存中的属性值，实现对目标 App 的属性伪装。
+    /// 直接 patch profile 目录中的二进制属性区域文件。可多次调用设置不同属性。
+    /// 格式: --set-prop <PROFILE> <key=value>
+    #[arg(
+        long = "set-prop",
+        value_name = "PROFILE",
+        conflicts_with_all = ["pid", "watch_so", "name", "spawn", "dump_props"],
+        num_args = 2,
+        value_names = ["PROFILE", "KEY=VALUE"]
+    )]
+    pub(crate) set_prop: Option<Vec<String>>,
+
+    /// 删除 profile 中的属性
+    ///
+    /// 清零属性值和 serial，使属性不可读。
+    /// 格式: --del-prop <PROFILE> <key>
+    #[arg(
+        long = "del-prop",
+        conflicts_with_all = ["pid", "watch_so", "name", "spawn", "dump_props", "set_prop", "repack_props"],
+        num_args = 2,
+        value_names = ["PROFILE", "KEY"]
+    )]
+    pub(crate) del_prop: Option<Vec<String>>,
+
+    /// 重排 profile 消除空洞（重新 dump + 重放变更日志）
+    #[arg(
+        long = "repack-props",
+        value_name = "PROFILE",
+        conflicts_with_all = ["pid", "watch_so", "name", "spawn", "dump_props", "set_prop", "del_prop"]
+    )]
+    pub(crate) repack_props: Option<String>,
+
+    /// 指定属性覆盖 profile（仅 --spawn 模式可用）
     #[arg(long = "profile", value_name = "NAME", requires = "spawn")]
     pub(crate) profile: Option<String>,
 }
