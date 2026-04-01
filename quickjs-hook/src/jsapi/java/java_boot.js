@@ -236,6 +236,20 @@
     // - 快捷调用:   obj.$call("methodName", "(sig)", ...args)
     function _wrapJavaObj(ptr, cls) {
         var target = {__jptr: ptr, __jclass: cls};
+        // 缓存方法名集合（lazy init），用于快速判断 prop 是方法还是字段
+        var _methodNames = null;
+        function hasMethod(name) {
+            if (_methodNames === null) {
+                _methodNames = {};
+                try {
+                    var ms = _methods(cls);
+                    for (var i = 0; i < ms.length; i++) {
+                        if (!ms[i].static) _methodNames[ms[i].name] = true;
+                    }
+                } catch(e) { /* ignore */ }
+            }
+            return _methodNames[name] === true;
+        }
         var handler = {
             get: function(target, prop) {
                 if (prop === "__jptr") return target.__jptr;
@@ -249,8 +263,6 @@
                 };
                 if (prop === "$className") return target.__jclass;
                 if (prop === "$call") {
-                    // Instance method invocation:
-                    //   obj.$call("methodName", "(I)V", arg1, arg2, ...)
                     return function(name, sig) {
                         if (typeof name !== "string" || typeof sig !== "string") {
                             throw new Error("obj.$call(name, sig, ...args) requires (string, string, ...)");
@@ -266,24 +278,25 @@
                 }
                 var jptr = target.__jptr;
                 var jcls = target.__jclass;
+
+                // 方法优先：如果存在同名实例方法，返回方法调用器。
+                // 避免 ArrayList.size 字段覆盖 size() 方法等冲突。
+                if (hasMethod(prop)) {
+                    return _makeInstanceMethodInvoker(target, prop);
+                }
+
+                // 无同名方法：尝试字段访问
                 var result;
                 try {
                     result = _getFieldAuto(jptr, jcls, prop);
                 } catch(e) {
-                    console.log("[_wrapJavaObj] _getFieldAuto ERROR: " + e
-                        + " ptr=" + jptr + " cls=" + jcls
-                        + " prop=" + prop);
                     return undefined;
                 }
-                // 如果字段存在（包括 null），按字段语义处理
                 if (result !== undefined) {
                     return _wrapJavaReturn(result);
                 }
 
-                // 没有同名字段：按方法处理，返回一个调用该方法的函数。
-                // 用法示例:
-                //   显式签名: obj.method("(I)V", 123)
-                //   自动匹配: obj.method("abc", 123)
+                // 字段也没有：兜底返回方法调用器（可能是继承方法不在 _methods 列表中）
                 return _makeInstanceMethodInvoker(target, prop);
             }
         };

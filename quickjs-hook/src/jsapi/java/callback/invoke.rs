@@ -757,13 +757,10 @@ pub(super) unsafe extern "C" fn js_java_new_object(
         );
     }
 
-    let class_sig = format!("L{};", class_name.replace('.', "/"));
-    let result = match wrap_invoke_return_object(ctx, env, obj, &class_sig) {
-        Ok(value) => value,
-        Err(message) => {
-            return cleanup_and_throw_internal(ctx, env, std::ptr::null_mut(), cls, message);
-        }
-    };
+    // $new 始终返回 Java 对象引用（{__jptr, __jclass}），不做 unbox/List→Array 转换。
+    // JS 侧 _wrapJavaReturn 会将其包装为 Proxy，支持方法调用和字段访问。
+    // class_name 保持 Java dot 格式（与 _methods() 一致）。
+    let result = wrap_java_object_ref(ctx, env, obj, &class_name, false);
 
     cleanup_local_refs(env, std::ptr::null_mut(), cls);
     result

@@ -125,12 +125,67 @@ unsafe fn marshal_js_to_jvalue(
                 }
                 jptr_val.free(ctx);
             }
-            // 非对象 JS 值 (number/boolean — unboxed primitive) 无法安全转回 JNI ref，返回 null。
-            // BigUint64 作为 raw jobject 指针的情况由上面 __jptr 分支处理。
+            // Autobox: JS number/boolean/bigint → Java 包装类型 (Integer/Boolean/Long/Double)
+            if let Some(boxed) = autobox_primitive_to_jobject(ctx, env, val) {
+                return boxed;
+            }
             0
         }
         _ => js_value_to_u64_or_zero(ctx, val),
     }
+}
+
+/// Autobox JS primitive → Java wrapper object via JNI static valueOf().
+/// number(int-range) → Integer, number(other) → Double, boolean → Boolean, bigint → Long.
+unsafe fn autobox_primitive_to_jobject(
+    _ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    val: JSValue,
+) -> Option<u64> {
+    use super::jni_core::*;
+    use super::reflect::find_class_safe;
+
+    // 通用 valueOf 调用: FindClass → GetStaticMethodID → CallStaticObjectMethodA
+    macro_rules! box_via_valueof {
+        ($class:expr, $sig:expr, $raw:expr) => {{
+            let cls = find_class_safe(env, $class);
+            if cls.is_null() { return None; }
+            let get_mid: GetStaticMethodIdFn = jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
+            let mid = get_mid(env, cls, b"valueOf\0".as_ptr() as _, $sig.as_ptr() as _);
+            let delete: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+            if mid.is_null() { delete(env, cls); return None; }
+            let call: CallStaticObjectMethodAFn =
+                jni_fn!(env, CallStaticObjectMethodAFn, JNI_CALL_STATIC_OBJECT_METHOD_A);
+            let jval: u64 = $raw;
+            let result = call(env, cls, mid, &jval as *const u64 as *const std::ffi::c_void);
+            delete(env, cls);
+            if result.is_null() { None } else { Some(result as u64) }
+        }};
+    }
+
+    // boolean → Boolean.valueOf(boolean)
+    if val.is_bool() {
+        let b = val.to_bool().unwrap_or(false);
+        return box_via_valueof!("java/lang/Boolean", b"(Z)Ljava/lang/Boolean;\0", b as u64);
+    }
+
+    // number → Integer.valueOf(int) 或 Double.valueOf(double)
+    if let Some(f) = val.to_float() {
+        let fits_int = f == (f as i32 as f64) && f.abs() < (i32::MAX as f64);
+        return if fits_int {
+            box_via_valueof!("java/lang/Integer", b"(I)Ljava/lang/Integer;\0", f as i32 as u32 as u64)
+        } else {
+            box_via_valueof!("java/lang/Double", b"(D)Ljava/lang/Double;\0", f.to_bits())
+        };
+    }
+
+    // bigint / i64 → Long.valueOf(long)
+    // (not int, not float → must be bigint if to_i64 succeeds)
+    if let Some(n) = val.to_i64(_ctx) {
+        return box_via_valueof!("java/lang/Long", b"(J)Ljava/lang/Long;\0", n as u64);
+    }
+
+    None
 }
 
 /// Invoke original ArtMethod via JNI using provided jvalue args.
