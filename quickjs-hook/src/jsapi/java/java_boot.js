@@ -118,7 +118,11 @@
         if (t0 === 'B' || t0 === 'S' || t0 === 'I' || t0 === 'F' || t0 === 'D')
             return jt === "number" ? 3 : -1;
         if (t0 === 'J') return (jt === "bigint" || jt === "number") ? 3 : -1;
-        if (t0 === 'C') return jt === "string" ? 3 : (jt === "number" ? 2 : -1);
+        // char: 单字符 string 精确匹配(3)，多字符 string 兼容(1)，number 兼容(2)
+        if (t0 === 'C') {
+            if (jt === "string") return jsVal.length === 1 ? 3 : 1;
+            return jt === "number" ? 2 : -1;
+        }
         return -1;
     }
 

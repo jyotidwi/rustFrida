@@ -757,10 +757,32 @@ pub(super) unsafe extern "C" fn js_java_new_object(
         );
     }
 
-    // $new 始终返回 Java 对象引用（{__jptr, __jclass}），不做 unbox/List→Array 转换。
-    // JS 侧 _wrapJavaReturn 会将其包装为 Proxy，支持方法调用和字段访问。
-    // class_name 保持 Java dot 格式（与 _methods() 一致）。
-    let result = wrap_java_object_ref(ctx, env, obj, &class_name, false);
+    // $new: String 和 boxed primitives → unbox 为 JS 值（不可变，无需 Proxy）
+    // 容器类型（List/Map/Set 等） → 保持 {__jptr, __jclass} 引用（Proxy 包装后可继续调方法）
+    let result = {
+        let jni_name = class_name.replace('.', "/");
+        let should_unbox = matches!(
+            jni_name.as_str(),
+            "java/lang/String"
+                | "java/lang/Integer"
+                | "java/lang/Long"
+                | "java/lang/Double"
+                | "java/lang/Float"
+                | "java/lang/Boolean"
+                | "java/lang/Byte"
+                | "java/lang/Short"
+                | "java/lang/Character"
+        );
+        if should_unbox {
+            let class_sig = format!("L{};", jni_name);
+            match wrap_invoke_return_object(ctx, env, obj, &class_sig) {
+                Ok(value) => value,
+                Err(_) => wrap_java_object_ref(ctx, env, obj, &class_name, false),
+            }
+        } else {
+            wrap_java_object_ref(ctx, env, obj, &class_name, false)
+        }
+    };
 
     cleanup_local_refs(env, std::ptr::null_mut(), cls);
     result
